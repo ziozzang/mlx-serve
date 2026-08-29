@@ -28312,6 +28312,91 @@ test "qmatmulBits nvfp4 matches dequantize+matmul reference" {
     for (0..OUT) |o| try testing.expectApproxEqAbs(gt[o], got_host[o], 5e-2);
 }
 
+test "Qwen4 expert qmm microbench: affine4 vs nvfp4 (QWEN4_NVFP4_UBENCH=1)" {
+    if (std.c.getenv("QWEN4_NVFP4_UBENCH") == null) return error.SkipZigTest;
+    const io_util = @import("io_util.zig");
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    const OUT: c_int = 640;
+    const IN: c_int = 2560;
+    const count: usize = @intCast(OUT * IN);
+
+    const host = try allocator.alloc(f32, count);
+    defer allocator.free(host);
+    var prng = std.Random.DefaultPrng.init(0x4E56465034);
+    for (host) |*v| v.* = (prng.random().float(f32) - 0.5) * 0.08;
+    const wshape = [_]c_int{ OUT, IN };
+    const w32 = mlx.mlx_array_new_data(host.ptr, &wshape, 2, .float32);
+    defer _ = mlx.mlx_array_free(w32);
+    var wb = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wb);
+    try mlx.check(mlx.mlx_astype(&wb, w32, .bfloat16, s));
+
+    const Quant = struct { w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array };
+    const makeQuant = struct {
+        fn go(w: mlx.mlx_array, mode: [:0]const u8, gs: c_int, str: mlx.mlx_stream) !Quant {
+            var parts = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(parts);
+            try mlx.check(mlx.mlx_quantize(&parts, w, mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(4), mode, .{}, str));
+            var q = Quant{ .w = mlx.mlx_array_new(), .sc = mlx.mlx_array_new(), .bi = .{ .ctx = null } };
+            try mlx.check(mlx.mlx_vector_array_get(&q.w, parts, 0));
+            try mlx.check(mlx.mlx_vector_array_get(&q.sc, parts, 1));
+            if (std.mem.eql(u8, mode, "affine")) {
+                q.bi = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_vector_array_get(&q.bi, parts, 2));
+            }
+            try mlx.check(mlx.mlx_array_eval(q.w));
+            try mlx.check(mlx.mlx_array_eval(q.sc));
+            if (q.bi.ctx != null) try mlx.check(mlx.mlx_array_eval(q.bi));
+            return q;
+        }
+    }.go;
+    const aq = try makeQuant(wb, "affine", 64, s);
+    defer {
+        for ([_]mlx.mlx_array{ aq.w, aq.sc, aq.bi }) |a| {
+            if (a.ctx != null) _ = mlx.mlx_array_free(a);
+        }
+    }
+    const nq = try makeQuant(wb, "nvfp4", 16, s);
+    defer {
+        for ([_]mlx.mlx_array{ nq.w, nq.sc }) |a| _ = mlx.mlx_array_free(a);
+    }
+
+    const run = struct {
+        fn go(x: mlx.mlx_array, q: Quant, mode: [:0]const u8, gs: c_int, str: mlx.mlx_stream) !void {
+            var y = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(y);
+            try mlx.check(mlx.mlx_quantized_matmul(&y, x, q.w, q.sc, q.bi, true, mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(4), mode, str));
+            try mlx.check(mlx.mlx_array_eval(y));
+        }
+    }.go;
+
+    for ([_]c_int{ 1, 4 }) |m| {
+        const xcount: usize = @intCast(m * IN);
+        const xhost = try allocator.alloc(f32, xcount);
+        defer allocator.free(xhost);
+        for (xhost) |*v| v.* = (prng.random().float(f32) - 0.5) * 0.2;
+        const xshape = [_]c_int{ m, IN };
+        const x32 = mlx.mlx_array_new_data(xhost.ptr, &xshape, 2, .float32);
+        defer _ = mlx.mlx_array_free(x32);
+        var xb = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xb);
+        try mlx.check(mlx.mlx_astype(&xb, x32, .bfloat16, s));
+        for (0..10) |_| {
+            try run(xb, aq, "affine", 64, s);
+            try run(xb, nq, "nvfp4", 16, s);
+        }
+        const iters: usize = 200;
+        var timer = io_util.Stopwatch.init(testing.io);
+        for (0..iters) |_| try run(xb, aq, "affine", 64, s);
+        const affine_us = @as(f64, @floatFromInt(timer.read())) / 1000.0 / @as(f64, @floatFromInt(iters));
+        timer.reset();
+        for (0..iters) |_| try run(xb, nq, "nvfp4", 16, s);
+        const nvfp4_us = @as(f64, @floatFromInt(timer.read())) / 1000.0 / @as(f64, @floatFromInt(iters));
+        std.debug.print("\n[qwen4-nvfp4-ubench] M={d} affine4-g64={d:.2} us nvfp4-g16={d:.2} us speedup={d:.3}x\n", .{ m, affine_us, nvfp4_us, affine_us / nvfp4_us });
+    }
+}
+
 /// Max |a - ref| as f32, for the gatherQmv no-worse-than-reference parity tests.
 fn gqmvMaxAbsErr(a: mlx.mlx_array, ref: mlx.mlx_array, str: mlx.mlx_stream) !f32 {
     var a32 = mlx.mlx_array_new();
