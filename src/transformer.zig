@@ -4559,6 +4559,26 @@ pub const Qwen4MtpRuntime = struct {
     }
 };
 
+/// Host-side half of Qwen4 PLE. Row ids remain owned until the asynchronous
+/// n-gram pread workers are joined, so an error path must drain before freeing
+/// them. The GPU can evaluate layer 0 while this ticket is in flight.
+const PleHostPrefetch = struct {
+    allocator: std.mem.Allocator,
+    table: *const qwen4_mod.NgramTable,
+    ids: []u32,
+    rows: []i64,
+    prev: [8]u32,
+    ctx_len: usize,
+    active: bool,
+
+    fn deinit(self: *PleHostPrefetch) void {
+        if (self.active) self.table.abandonGather();
+        self.allocator.free(self.rows);
+        self.allocator.free(self.ids);
+        self.* = undefined;
+    }
+};
+
 const LinearAttnWeights = struct {
     // For separate projections (qwen3_5_moe): qkv=QKV, z=Z, a=A, b=B
     // For combined projections (qwen3_next): qkv=QKVZ, b=BA, z/a unused
@@ -11092,9 +11112,10 @@ pub const Transformer = struct {
         return next;
     }
 
-    /// Host-side n-gram gather: `[1, S, ple_embed_dim]` bf16 for this chunk's
-    /// token ids, advancing the entry's 2-token history. Batch 1 only.
-    fn pleEmbedding(self: *Transformer, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, seq_len: c_int) !mlx.mlx_array {
+    /// Resolve the PLE row ids and launch their disk reads before layer 0.
+    /// Token ids are tiny and already materialized by the sampler; only the
+    /// n-gram table I/O remains outstanding on return.
+    fn preparePleEmbedding(self: *Transformer, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, seq_len: c_int) !PleHostPrefetch {
         const st = self.qwen4.?;
         const ctx_len: usize = st.hash.ngram_size - 1;
         // Draft ids arrive as lazy graphs of whatever dtype the sampler
@@ -11108,7 +11129,7 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_array_eval(ids_c));
         const n: usize = @intCast(seq_len);
         const ids = try self.allocator.alloc(u32, n);
-        defer self.allocator.free(ids);
+        errdefer self.allocator.free(ids);
         const src = mlx.mlx_array_data_int32(ids_c) orelse return error.TokenIdsUnreadable;
         for (0..n) |i| ids[i] = @intCast(src[i]);
         var prev: [8]u32 = @splat(st.hash.eos);
@@ -11119,26 +11140,48 @@ pub const Transformer = struct {
             entry.spec_ple_len = @intCast(ctx_len + n);
         } else entry.spec_ple_len = 0;
         const rows = try self.allocator.alloc(i64, n * st.hash.n_heads);
-        defer self.allocator.free(rows);
+        errdefer self.allocator.free(rows);
         st.hash.rowIds(prev[0..ctx_len], ids, rows);
+
+        return .{
+            .allocator = self.allocator,
+            .table = &st.table,
+            .ids = ids,
+            .rows = rows,
+            .prev = prev,
+            .ctx_len = ctx_len,
+            .active = st.table.beginGather(rows),
+        };
+    }
+
+    /// Join a prepared gather, advance the two-token PLE history, and upload
+    /// `[1,S,ple_embed_dim]` as bf16. A non-prefetched width uses the existing
+    /// synchronous gather unchanged.
+    fn finishPleEmbedding(self: *Transformer, prep: *PleHostPrefetch, entry: *SSMCacheEntry, seq_len: c_int) !mlx.mlx_array {
+        const st = self.qwen4.?;
+        const n = prep.ids.len;
         const emb_dim: usize = st.table.dim * st.hash.n_heads;
         const host = try self.allocator.alloc(f32, n * emb_dim);
         defer self.allocator.free(host);
         var gclk: ProfClock = if (diagEnvOn("QWEN4_PROFILE_FWD")) ProfClock.init() else undefined;
-        st.table.gather(rows, host);
+        if (prep.active) {
+            const ok = st.table.finishGather(prep.rows, host);
+            prep.active = false;
+            if (!ok) st.table.gather(prep.rows, host);
+        } else {
+            st.table.gather(prep.rows, host);
+        }
         if (diagEnvOn("QWEN4_PROFILE_FWD")) log.info("[qwen4-prof] ple gather S={d}: {d:.2} ms\n", .{ seq_len, @as(f64, @floatFromInt(gclk.lap())) / 1e6 });
         // Advance the history: the last ctx_len tokens of prev ++ ids.
-        var hist: [16]u32 = undefined;
-        for (0..ctx_len) |i| hist[i] = prev[i];
-        const tail_from: usize = if (n >= ctx_len) n - ctx_len else 0;
+        const tail_from: usize = if (n >= prep.ctx_len) n - prep.ctx_len else 0;
         var k: usize = 0;
-        if (n < ctx_len) {
+        if (n < prep.ctx_len) {
             // Shift the old history left and append everything.
-            for (0..ctx_len - n) |i| entry.ple_prev[i] = prev[n + i];
-            k = ctx_len - n;
+            for (0..prep.ctx_len - n) |i| entry.ple_prev[i] = prep.prev[n + i];
+            k = prep.ctx_len - n;
         }
         for (tail_from..n) |i| {
-            entry.ple_prev[k] = ids[i];
+            entry.ple_prev[k] = prep.ids[i];
             k += 1;
         }
         entry.ple_prev_valid = true;
@@ -11166,12 +11209,18 @@ pub const Transformer = struct {
     }
 
     /// Qwen4ExpTextPLELayer.forward → the `[B,S,hc*hidden]` addend.
-    fn pleForward(self: *Transformer, stream: mlx.mlx_array, token_ids: mlx.mlx_array, pw: *const PleWeights, entry: *SSMCacheEntry, batch: c_int, seq_len: c_int) !mlx.mlx_array {
+    fn pleForward(self: *Transformer, stream: mlx.mlx_array, token_ids: mlx.mlx_array, pw: *const PleWeights, entry: *SSMCacheEntry, batch: c_int, seq_len: c_int, prepared: ?*PleHostPrefetch) !mlx.mlx_array {
         if (batch != 1) return error.Qwen4BatchUnsupported;
         const cfg = &self.config;
         const hc: c_int = @intCast(cfg.hc_count);
         const hidden: c_int = @intCast(cfg.hidden_size);
-        const emb = try self.pleEmbedding(token_ids, entry, seq_len);
+        var local: ?PleHostPrefetch = null;
+        defer if (local) |*p| p.deinit();
+        const prep = prepared orelse blk: {
+            local = try self.preparePleEmbedding(token_ids, entry, seq_len);
+            break :blk &local.?;
+        };
+        const emb = try self.finishPleEmbedding(prep, entry, seq_len);
         defer _ = mlx.mlx_array_free(emb);
         if (qwen4_trace) |tr| Qwen4Trace.set(&tr.ple_emb, emb);
 
@@ -11954,6 +12003,17 @@ pub const Transformer = struct {
         const seq_len: c_int = x_shape[1];
         const is_prefill = seq_len > 1;
 
+        // FreeToken-style PLE overlap: resolve the tiny token-id hash and
+        // launch disk reads before layer 0. At the boundary immediately
+        // preceding the PLE layer we async-evaluate the accumulated Metal
+        // graph, allowing its GPU work and these host preads to run together.
+        var ple_prefetch: ?PleHostPrefetch = null;
+        defer if (ple_prefetch) |*p| p.deinit();
+        if (cfg.ple_layer_idx >= 0 and @as(usize, @intCast(cfg.ple_layer_idx)) < entries.len) {
+            const ple_li: usize = @intCast(cfg.ple_layer_idx);
+            ple_prefetch = try self.preparePleEmbedding(token_ids, &entries[ple_li], seq_len);
+        }
+
         const reps = [_]c_int{ 1, 1, hc };
         var h = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_tile(&h, emb, &reps, 3, self.s));
@@ -11994,7 +12054,7 @@ pub const Transformer = struct {
 
             if (lw.ple) |*pw| {
                 try self.hcFlush(&h, batch, seq_len, &pending);
-                const add = try self.pleForward(h, token_ids, pw, entry, batch, seq_len);
+                const add = try self.pleForward(h, token_ids, pw, entry, batch, seq_len, if (ple_prefetch) |*p| p else null);
                 defer _ = mlx.mlx_array_free(add);
                 var h_ple = mlx.mlx_array_new();
                 try mlx.check(mlx.mlx_add(&h_ple, h, add, self.s));
@@ -12040,6 +12100,21 @@ pub const Transformer = struct {
             try self.hcWriteOrDefer(&h, mlp_out, pre2.inj, batch, seq_len, &pending);
             if (prof.timing) try self.hcFlush(&h, batch, seq_len, &pending);
             try prof.lap(h, .hc_write);
+
+            // The next layer consumes the PLE rows. Flush the deferred HC tail
+            // into `h` and submit it without waiting; `finishPleEmbedding`
+            // joins the host reads while Metal evaluates this dependency.
+            if (layer_idx + 1 == cfg.ple_layer_idx) {
+                if (ple_prefetch) |*p| {
+                    if (p.active) {
+                        try self.hcFlush(&h, batch, seq_len, &pending);
+                        const ev = mlx.mlx_vector_array_new();
+                        defer _ = mlx.mlx_vector_array_free(ev);
+                        _ = mlx.mlx_vector_array_append_value(ev, h);
+                        try mlx.check(mlx.mlx_async_eval(ev));
+                    }
+                }
+            }
             prof.endLayer(if (lw.ple != null) .ple else if (lw.attn == .linear) .gdn else .attn);
 
             if (ctx.capture_layers) |cl| {
