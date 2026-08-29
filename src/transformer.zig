@@ -4550,6 +4550,26 @@ const Qwen4Mtp = struct {
     pos_base: c_int = 0,
 };
 
+/// Host-side half of Qwen4 PLE. Row ids remain owned until the asynchronous
+/// n-gram pread workers are joined, so an error path must drain before freeing
+/// them. The GPU can evaluate layer 0 while this ticket is in flight.
+const PleHostPrefetch = struct {
+    allocator: std.mem.Allocator,
+    table: *const qwen4_mod.NgramTable,
+    ids: []u32,
+    rows: []i64,
+    prev: [8]u32,
+    ctx_len: usize,
+    active: bool,
+
+    fn deinit(self: *PleHostPrefetch) void {
+        if (self.active) self.table.abandonGather();
+        self.allocator.free(self.rows);
+        self.allocator.free(self.ids);
+        self.* = undefined;
+    }
+};
+
 const LinearAttnWeights = struct {
     // For separate projections (qwen3_5_moe): qkv=QKV, z=Z, a=A, b=B
     // For combined projections (qwen3_next): qkv=QKVZ, b=BA, z/a unused
@@ -11187,6 +11207,78 @@ pub const Transformer = struct {
         entry.ple_prev_valid = true;
     }
 
+    /// Resolve the serial PLE row ids and launch their disk reads before
+    /// layer 0. Batched decode keeps using `pleEmbedding`: it combines every
+    /// lane into one table gather and therefore must not create N tickets.
+    fn preparePleEmbedding(self: *Transformer, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, seq_len: c_int) !PleHostPrefetch {
+        const st = self.qwen4.?;
+        const ctx_len: usize = st.hash.ngram_size - 1;
+        var ids_i32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ids_i32);
+        try mlx.check(mlx.mlx_astype(&ids_i32, token_ids, .int32, self.s));
+        var ids_c = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ids_c);
+        try mlx.check(mlx.mlx_contiguous(&ids_c, ids_i32, false, self.s));
+        try mlx.check(mlx.mlx_array_eval(ids_c));
+        const n: usize = @intCast(seq_len);
+        const ids = try self.allocator.alloc(u32, n);
+        errdefer self.allocator.free(ids);
+        const src = mlx.mlx_array_data_int32(ids_c) orelse return error.TokenIdsUnreadable;
+        for (0..n) |i| ids[i] = @intCast(src[i]);
+        var prev: [8]u32 = @splat(st.hash.eos);
+        if (entry.ple_prev_valid) prev = entry.ple_prev;
+        if (self.spec_capture_ssm and ctx_len + n <= entry.spec_ple_tokens.len) {
+            for (0..ctx_len) |i| entry.spec_ple_tokens[i] = prev[i];
+            for (0..n) |i| entry.spec_ple_tokens[ctx_len + i] = ids[i];
+            entry.spec_ple_len = @intCast(ctx_len + n);
+        } else entry.spec_ple_len = 0;
+        const rows = try self.allocator.alloc(i64, n * st.hash.n_heads);
+        errdefer self.allocator.free(rows);
+        st.hash.rowIds(prev[0..ctx_len], ids, rows);
+        return .{
+            .allocator = self.allocator,
+            .table = &st.table,
+            .ids = ids,
+            .rows = rows,
+            .prev = prev,
+            .ctx_len = ctx_len,
+            .active = st.table.beginGather(rows),
+        };
+    }
+
+    fn finishPleEmbedding(self: *Transformer, prep: *PleHostPrefetch, entry: *SSMCacheEntry, seq_len: c_int) !mlx.mlx_array {
+        const st = self.qwen4.?;
+        const n = prep.ids.len;
+        const emb_dim: usize = st.table.dim * st.hash.n_heads;
+        const host = try self.allocator.alloc(f32, n * emb_dim);
+        defer self.allocator.free(host);
+        var gclk: ProfClock = if (diagEnvOn("QWEN4_PROFILE_FWD")) ProfClock.init() else undefined;
+        if (prep.active) {
+            const ok = st.table.finishGather(prep.rows, host);
+            prep.active = false;
+            if (!ok) st.table.gather(prep.rows, host);
+        } else st.table.gather(prep.rows, host);
+        if (diagEnvOn("QWEN4_PROFILE_FWD")) log.info("[qwen4-prof] ple gather S={d}: {d:.2} ms\n", .{ seq_len, @as(f64, @floatFromInt(gclk.lap())) / 1e6 });
+        advancePlePrev(entry, prep.prev, prep.ids, prep.ctx_len);
+        if (std.c.getenv("QWEN4_PLE_GPU_CAST") != null) {
+            const shape0 = [_]c_int{ 1, seq_len, @intCast(emb_dim) };
+            const f32_arr = mlx.mlx_array_new_data(host.ptr, &shape0, 3, .float32);
+            defer _ = mlx.mlx_array_free(f32_arr);
+            var out0 = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&out0, f32_arr, .bfloat16, self.s));
+            try mlx.check(mlx.mlx_array_eval(out0));
+            return out0;
+        }
+        const pk = try self.allocator.alloc(u16, host.len);
+        defer self.allocator.free(pk);
+        for (host, 0..) |v, i| {
+            const u: u32 = @bitCast(v);
+            pk[i] = @intCast((u +% 0x7FFF +% ((u >> 16) & 1)) >> 16);
+        }
+        const shape = [_]c_int{ 1, seq_len, @intCast(emb_dim) };
+        return mlx.mlx_array_new_data(pk.ptr, &shape, 3, .bfloat16);
+    }
+
     /// Host-side n-gram gather: `[B, S, ple_embed_dim]` bf16 for this chunk's
     /// token ids, advancing the token history. Serial: `entry`'s history over
     /// `[1, S]`. Batched (`ctx.batch_slots`): `[N, 1]`, each row hashed
@@ -11264,11 +11356,21 @@ pub const Transformer = struct {
 
     /// Qwen4ExpTextPLELayer.forward → the `[B,S,hc*hidden]` addend. Batched
     /// decode hands in the MERGED conv window as `entry.aux_state`.
-    fn pleForward(self: *Transformer, ctx: *ForwardCtx, stream: mlx.mlx_array, token_ids: mlx.mlx_array, pw: *const PleWeights, entry: *SSMCacheEntry, layer: usize, batch: c_int, seq_len: c_int) !mlx.mlx_array {
+    fn pleForward(self: *Transformer, ctx: *ForwardCtx, stream: mlx.mlx_array, token_ids: mlx.mlx_array, pw: *const PleWeights, entry: *SSMCacheEntry, layer: usize, batch: c_int, seq_len: c_int, prepared: ?*PleHostPrefetch) !mlx.mlx_array {
         const cfg = &self.config;
         const hc: c_int = @intCast(cfg.hc_count);
         const hidden: c_int = @intCast(cfg.hidden_size);
-        const emb = try self.pleEmbedding(ctx, token_ids, entry, layer, seq_len);
+        var local: ?PleHostPrefetch = null;
+        defer if (local) |*p| p.deinit();
+        const emb = if (ctx.batch_slots != null)
+            try self.pleEmbedding(ctx, token_ids, entry, layer, seq_len)
+        else blk: {
+            const prep = prepared orelse p: {
+                local = try self.preparePleEmbedding(token_ids, entry, seq_len);
+                break :p &local.?;
+            };
+            break :blk try self.finishPleEmbedding(prep, entry, seq_len);
+        };
         defer _ = mlx.mlx_array_free(emb);
         if (qwen4_trace) |tr| Qwen4Trace.set(&tr.ple_emb, emb);
 
@@ -12061,6 +12163,16 @@ pub const Transformer = struct {
         const seq_len: c_int = x_shape[1];
         const is_prefill = seq_len > 1;
 
+        // Serial FreeToken-style overlap: launch the disk-backed n-gram rows
+        // before layer 0, then join immediately before the PLE layer. Batched
+        // decode deliberately stays on `pleEmbedding`'s one combined gather.
+        var ple_prefetch: ?PleHostPrefetch = null;
+        defer if (ple_prefetch) |*p| p.deinit();
+        if (ctx.batch_slots == null and cfg.ple_layer_idx >= 0 and @as(usize, @intCast(cfg.ple_layer_idx)) < entries.len) {
+            const ple_li: usize = @intCast(cfg.ple_layer_idx);
+            ple_prefetch = try self.preparePleEmbedding(token_ids, &entries[ple_li], seq_len);
+        }
+
         const reps = [_]c_int{ 1, 1, hc };
         var h = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_tile(&h, emb, &reps, 3, self.s));
@@ -12101,7 +12213,7 @@ pub const Transformer = struct {
 
             if (lw.ple) |*pw| {
                 try self.hcFlush(&h, batch, seq_len, &pending);
-                const add = try self.pleForward(ctx, h, token_ids, pw, entry, layer_idx, batch, seq_len);
+                const add = try self.pleForward(ctx, h, token_ids, pw, entry, layer_idx, batch, seq_len, if (ple_prefetch) |*p| p else null);
                 defer _ = mlx.mlx_array_free(add);
                 var h_ple = mlx.mlx_array_new();
                 try mlx.check(mlx.mlx_add(&h_ple, h, add, self.s));
@@ -12147,6 +12259,18 @@ pub const Transformer = struct {
             try self.hcWriteOrDefer(&h, mlp_out, pre2.inj, batch, seq_len, &pending);
             if (prof.timing) try self.hcFlush(&h, batch, seq_len, &pending);
             try prof.lap(h, .hc_write);
+
+            if (layer_idx + 1 == cfg.ple_layer_idx) {
+                if (ple_prefetch) |*p| {
+                    if (p.active) {
+                        try self.hcFlush(&h, batch, seq_len, &pending);
+                        const ev = mlx.mlx_vector_array_new();
+                        defer _ = mlx.mlx_vector_array_free(ev);
+                        _ = mlx.mlx_vector_array_append_value(ev, h);
+                        try mlx.check(mlx.mlx_async_eval(ev));
+                    }
+                }
+            }
             prof.endLayer(if (lw.ple != null) .ple else if (lw.attn == .linear) .gdn else .attn);
 
             if (ctx.capture_layers) |cl| {
@@ -18395,39 +18519,41 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             const v_s = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.scales") orelse k_s;
             const v_b = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.biases") orelse k_b;
             const v_aliases_k = v_w.ctx == k_w.ctx;
-            lw.attn = .{ .full = .{
-                .q_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.weight"),
-                .q_s = if (is_laguna)
-                    (getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.q_proj.scales") orelse mlx.mlx_array_new())
-                else
-                    try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.scales", config.quant_bits),
-                .q_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.q_proj.biases", &config),
-                .k_w = k_w,
-                .k_s = k_s,
-                .k_b = k_b,
-                .v_w = v_w,
-                .v_s = v_s,
-                .v_b = v_b,
-                .o_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.weight"),
-                .o_s = if (is_laguna)
-                    (getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.o_proj.scales") orelse mlx.mlx_array_new())
-                else
-                    try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.o_proj.scales", config.quant_bits),
-                .o_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.o_proj.biases", &config),
-                // An arch that DECLARES QK norm must ship it (a missing weight
-                // there is a broken checkpoint, not a variant). One that
-                // declares it off — gpt_oss — has no q_norm/k_norm tensors at
-                // all, and the mandatory getter's `unreachable` would kill the
-                // process on load rather than report anything.
-                .q_norm = if (config.has_qk_norm)
-                    try getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_norm.weight")
-                else
-                    (getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.q_norm.weight") orelse mlx.mlx_array_new()),
-                .k_norm = if (config.has_qk_norm)
-                    try getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_norm.weight")
-                else
-                    (getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.k_norm.weight") orelse mlx.mlx_array_new()),
-            } };
+            lw.attn = .{
+                .full = .{
+                    .q_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.weight"),
+                    .q_s = if (is_laguna)
+                        (getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.q_proj.scales") orelse mlx.mlx_array_new())
+                    else
+                        try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.scales", config.quant_bits),
+                    .q_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.q_proj.biases", &config),
+                    .k_w = k_w,
+                    .k_s = k_s,
+                    .k_b = k_b,
+                    .v_w = v_w,
+                    .v_s = v_s,
+                    .v_b = v_b,
+                    .o_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.weight"),
+                    .o_s = if (is_laguna)
+                        (getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.o_proj.scales") orelse mlx.mlx_array_new())
+                    else
+                        try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.o_proj.scales", config.quant_bits),
+                    .o_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.o_proj.biases", &config),
+                    // An arch that DECLARES QK norm must ship it (a missing weight
+                    // there is a broken checkpoint, not a variant). One that
+                    // declares it off — gpt_oss — has no q_norm/k_norm tensors at
+                    // all, and the mandatory getter's `unreachable` would kill the
+                    // process on load rather than report anything.
+                    .q_norm = if (config.has_qk_norm)
+                        try getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_norm.weight")
+                    else
+                        (getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.q_norm.weight") orelse mlx.mlx_array_new()),
+                    .k_norm = if (config.has_qk_norm)
+                        try getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_norm.weight")
+                    else
+                        (getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.k_norm.weight") orelse mlx.mlx_array_new()),
+                },
+            };
             {
                 // Dense bf16 (null-ctx scales): pre-transpose [out,in]→[in,out] so
                 // qmatmulBits dispatches to a plain matmul. No-op on quantized weights.
@@ -18870,40 +18996,42 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             // so the additive bias is the ONLY `bias`-ish tensor present on a
             // gpt_oss expert bank, and binding it into `*_b` would hand
             // gather_qmm a zero-point tensor of the wrong rank.
-            lw.mlp = .{ .moe = .{
-                .router_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.router.weight"),
-                .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.router.scales") orelse mlx.mlx_array_new(),
-                .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.router.biases") orelse mlx.mlx_array_new(),
-                .router_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.router.bias") orelse .{ .ctx = null },
-                .switch_gate_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.gate_proj.weight"),
-                .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.gate_proj.scales") orelse mlx.mlx_array_new(),
-                .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.gate_proj.biases") orelse mlx.mlx_array_new(),
-                .switch_gate_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.gate_proj.bias") orelse .{ .ctx = null },
-                .switch_up_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.up_proj.weight"),
-                .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.up_proj.scales") orelse mlx.mlx_array_new(),
-                .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.up_proj.biases") orelse mlx.mlx_array_new(),
-                .switch_up_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.up_proj.bias") orelse .{ .ctx = null },
-                .switch_down_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.down_proj.weight"),
-                .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.down_proj.scales") orelse mlx.mlx_array_new(),
-                .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.down_proj.biases") orelse mlx.mlx_array_new(),
-                .switch_down_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.down_proj.bias") orelse .{ .ctx = null },
-                // No shared expert: empty handles, and shared_expert_gate_w
-                // stays null so the forward never reads them.
-                .shared_gate_w = mlx.mlx_array_new(),
-                .shared_gate_s = mlx.mlx_array_new(),
-                .shared_gate_b = mlx.mlx_array_new(),
-                .shared_up_w = mlx.mlx_array_new(),
-                .shared_up_s = mlx.mlx_array_new(),
-                .shared_up_b = mlx.mlx_array_new(),
-                .shared_down_w = mlx.mlx_array_new(),
-                .shared_down_s = mlx.mlx_array_new(),
-                .shared_down_b = mlx.mlx_array_new(),
-                .shared_expert_gate_w = null,
-                .shared_expert_gate_s = null,
-                .shared_expert_gate_b = null,
-                .route_norm = config.moe_route_norm,
-                .route_scale = config.router_scaling_factor,
-            } };
+            lw.mlp = .{
+                .moe = .{
+                    .router_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.router.weight"),
+                    .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.router.scales") orelse mlx.mlx_array_new(),
+                    .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.router.biases") orelse mlx.mlx_array_new(),
+                    .router_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.router.bias") orelse .{ .ctx = null },
+                    .switch_gate_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.gate_proj.weight"),
+                    .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.gate_proj.scales") orelse mlx.mlx_array_new(),
+                    .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.gate_proj.biases") orelse mlx.mlx_array_new(),
+                    .switch_gate_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.gate_proj.bias") orelse .{ .ctx = null },
+                    .switch_up_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.up_proj.weight"),
+                    .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.up_proj.scales") orelse mlx.mlx_array_new(),
+                    .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.up_proj.biases") orelse mlx.mlx_array_new(),
+                    .switch_up_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.up_proj.bias") orelse .{ .ctx = null },
+                    .switch_down_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.down_proj.weight"),
+                    .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.down_proj.scales") orelse mlx.mlx_array_new(),
+                    .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.down_proj.biases") orelse mlx.mlx_array_new(),
+                    .switch_down_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.down_proj.bias") orelse .{ .ctx = null },
+                    // No shared expert: empty handles, and shared_expert_gate_w
+                    // stays null so the forward never reads them.
+                    .shared_gate_w = mlx.mlx_array_new(),
+                    .shared_gate_s = mlx.mlx_array_new(),
+                    .shared_gate_b = mlx.mlx_array_new(),
+                    .shared_up_w = mlx.mlx_array_new(),
+                    .shared_up_s = mlx.mlx_array_new(),
+                    .shared_up_b = mlx.mlx_array_new(),
+                    .shared_down_w = mlx.mlx_array_new(),
+                    .shared_down_s = mlx.mlx_array_new(),
+                    .shared_down_b = mlx.mlx_array_new(),
+                    .shared_expert_gate_w = null,
+                    .shared_expert_gate_s = null,
+                    .shared_expert_gate_b = null,
+                    .route_norm = config.moe_route_norm,
+                    .route_scale = config.router_scaling_factor,
+                },
+            };
             {
                 const mw = &lw.mlp.moe;
                 try maybeTransposeForBf16(&mw.router_w, mw.router_s, &owned_bf16, allocator, s);

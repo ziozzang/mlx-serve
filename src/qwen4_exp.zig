@@ -250,6 +250,40 @@ pub const NgramTable = struct {
         for (row_ids, 0..) |r, i| self.row(@intCast(r), out[i * self.dim ..][0..self.dim]);
     }
 
+    /// Start the small decode/verify gather without waiting for it.  The
+    /// caller may enqueue independent Metal work before `finishGather`, which
+    /// is how FreeToken hides PLE storage latency behind the first trunk
+    /// layer. Only one forward runs on mlx-serve's inference thread, so the
+    /// table has at most one outstanding ticket.
+    pub fn beginGather(self: *const NgramTable, row_ids: []const i64) bool {
+        if (!pleAsyncEnabled()) return false;
+        const need: usize = self.wcols * 4 + self.scols * 4;
+        const p = self.pool orelse return false;
+        if (self.fd < 0 or need > PrefetchPool.ROW_BUF or row_ids.len == 0 or row_ids.len > PrefetchPool.MAX_ROWS) return false;
+        return p.start(self, row_ids);
+    }
+
+    /// Join a gather started by `beginGather` and dequantize its resident row
+    /// buffers. Returns false on a short read; callers then use `gather` as the
+    /// correctness fallback.
+    pub fn finishGather(self: *const NgramTable, row_ids: []const i64, out: []f32) bool {
+        const p = self.pool orelse return false;
+        if (!p.wait()) return false;
+        const wl: usize = self.wcols * 4;
+        const sl: usize = self.scols * 2;
+        for (row_ids, 0..) |_, i| {
+            const b = &p.bufs[i];
+            self.dequantRow(b[0..wl], b[wl .. wl + sl], b[wl + sl .. wl + 2 * sl], out[i * self.dim ..][0..self.dim]);
+        }
+        return true;
+    }
+
+    /// Drain an outstanding gather on an error path before its borrowed row
+    /// id slice is released.
+    pub fn abandonGather(self: *const NgramTable) void {
+        if (self.pool) |p| _ = p.wait();
+    }
+
     /// One (row, region) pread into the pool's row buffer. False on a short read.
     fn preadSite(self: *const NgramTable, r: u64, region: usize, buf: []u8) bool {
         const wl: usize = self.wcols * 4;
@@ -261,7 +295,6 @@ pub const NgramTable = struct {
         };
         return std.c.pread(self.fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
     }
-
 };
 
 /// Persistent gather workers. Every row's three regions are one SSD read on
@@ -316,7 +349,8 @@ const PrefetchPool = struct {
     }
 
     /// Fan the `3 * rows.len` preads over the workers; rows land in `bufs`.
-    fn run(self: *PrefetchPool, table: *const NgramTable, rows: []const i64) bool {
+    fn start(self: *PrefetchPool, table: *const NgramTable, rows: []const i64) bool {
+        if (self.pending.load(.acquire) != 0) return false;
         const io = std.Io.Threaded.global_single_threaded.io();
         self.mu.lockUncancelable(io);
         self.table = table;
@@ -326,8 +360,17 @@ const PrefetchPool = struct {
         self.gen += 1;
         self.cv.broadcast(io);
         self.mu.unlock(io);
+        return true;
+    }
+
+    fn wait(self: *PrefetchPool) bool {
         while (self.pending.load(.acquire) != 0) std.atomic.spinLoopHint();
         return self.failed.load(.acquire) == 0;
+    }
+
+    fn run(self: *PrefetchPool, table: *const NgramTable, rows: []const i64) bool {
+        if (!self.start(table, rows)) return false;
+        return self.wait();
     }
 
     fn worker(self: *PrefetchPool, idx: usize) void {
@@ -359,6 +402,17 @@ fn plePrefetchEnabled() bool {
     };
     if (S.v) |v| return v;
     const raw = std.c.getenv("QWEN4_PLE_PREFETCH");
+    const v = raw == null or raw.?[0] != '0';
+    S.v = v;
+    return v;
+}
+
+fn pleAsyncEnabled() bool {
+    const S = struct {
+        var v: ?bool = null;
+    };
+    if (S.v) |v| return v;
+    const raw = std.c.getenv("QWEN4_PLE_ASYNC");
     const v = raw == null or raw.?[0] != '0';
     S.v = v;
     return v;
