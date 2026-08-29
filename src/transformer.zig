@@ -4579,6 +4579,29 @@ const PleHostPrefetch = struct {
     }
 };
 
+/// One PLE storage ticket for an equal-length request cohort. Row hashing and
+/// token history remain lane-local, while the table sees one combined gather:
+/// its worker pool permits only one outstanding ticket at a time.
+const PleBatchPrefetch = struct {
+    allocator: std.mem.Allocator,
+    table: *const qwen4_mod.NgramTable,
+    ids: []u32, // [B*S]
+    rows: []i64, // [B*S*n_heads]
+    prevs: [][8]u32, // [B]
+    batch: usize,
+    seq_len: usize,
+    ctx_len: usize,
+    active: bool,
+
+    fn deinit(self: *PleBatchPrefetch) void {
+        if (self.active) self.table.abandonGather();
+        self.allocator.free(self.prevs);
+        self.allocator.free(self.rows);
+        self.allocator.free(self.ids);
+        self.* = undefined;
+    }
+};
+
 const LinearAttnWeights = struct {
     // For separate projections (qwen3_5_moe): qkv=QKV, z=Z, a=A, b=B
     // For combined projections (qwen3_next): qkv=QKVZ, b=BA, z/a unused
@@ -10680,6 +10703,8 @@ pub const Transformer = struct {
         defer for (merged) |*m| {
             if (m.conv_state.ctx != null) _ = mlx.mlx_array_free(m.conv_state);
             if (m.ssm_state.ctx != null) _ = mlx.mlx_array_free(m.ssm_state);
+            if (m.aux_state.ctx != null) _ = mlx.mlx_array_free(m.aux_state);
+            if (m.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(m.qsa_pooled);
         };
         for (ml, 0..) |*lw, l| {
             if (!lw.is_linear) continue;
@@ -10734,6 +10759,8 @@ pub const Transformer = struct {
         errdefer {
             _ = mlx.mlx_array_free(out.conv_state);
             _ = mlx.mlx_array_free(out.ssm_state);
+            if (out.aux_state.ctx != null) _ = mlx.mlx_array_free(out.aux_state);
+            if (out.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(out.qsa_pooled);
         }
         const conv = try self.allocator.alloc(mlx.mlx_array, ctxs.len);
         defer self.allocator.free(conv);
@@ -10750,6 +10777,57 @@ pub const Transformer = struct {
         const svec = mlx.mlx_vector_array_new_data(ssm.ptr, ssm.len);
         defer _ = mlx.mlx_vector_array_free(svec);
         try mlx.check(mlx.mlx_concatenate_axis(&out.ssm_state, svec, 0, self.s));
+
+        // Qwen4 carries two more batched arrays in the same cache entry:
+        // PLE's convolution window / QSA's raw-key tail in aux_state and
+        // QSA's pooled block keys.  They are absent on qwen3.5, so preserving
+        // them here is a no-op for the existing decode path while making this
+        // merge primitive safe for the Qwen4 equal-length batch path.
+        out.aux_state = try self.mergeOptionalSsmArray(ctxs, layer, false);
+        out.qsa_pooled = try self.mergeOptionalSsmArray(ctxs, layer, true);
+        const first = &ctxs[0].ssm_entries.?[layer];
+        out.qsa_ratio = first.qsa_ratio;
+        out.qsa_len = first.qsa_len;
+        for (ctxs[1..]) |c| {
+            const e = &c.ssm_entries.?[layer];
+            if (e.qsa_ratio != out.qsa_ratio or e.qsa_len != out.qsa_len)
+                return error.Qwen4BatchStateLengthMismatch;
+        }
+        return out;
+    }
+
+    /// Concatenate an optional rank-3 Qwen4 state on its batch axis.  A mixed
+    /// present/absent cohort is never valid: it means requests are at
+    /// different state boundaries and must remain serial.
+    fn mergeOptionalSsmArray(self: *Transformer, ctxs: []const *ForwardCtx, layer: usize, pooled: bool) !mlx.mlx_array {
+        const first = &ctxs[0].ssm_entries.?[layer];
+        const first_arr = if (pooled) first.qsa_pooled else first.aux_state;
+        if (first_arr.ctx == null) {
+            for (ctxs[1..]) |c| {
+                const e = &c.ssm_entries.?[layer];
+                const arr = if (pooled) e.qsa_pooled else e.aux_state;
+                if (arr.ctx != null) return error.Qwen4BatchStatePresenceMismatch;
+            }
+            return mlx.mlx_array_new();
+        }
+        const arrays = try self.allocator.alloc(mlx.mlx_array, ctxs.len);
+        defer self.allocator.free(arrays);
+        const shape0 = mlx.getShape(first_arr);
+        if (shape0.len != 3 or shape0[0] != 1) return error.Qwen4BatchStateShapeMismatch;
+        for (ctxs, 0..) |c, i| {
+            const e = &c.ssm_entries.?[layer];
+            const arr = if (pooled) e.qsa_pooled else e.aux_state;
+            if (arr.ctx == null) return error.Qwen4BatchStatePresenceMismatch;
+            const shape = mlx.getShape(arr);
+            if (shape.len != 3 or shape[0] != 1 or shape[1] != shape0[1] or shape[2] != shape0[2])
+                return error.Qwen4BatchStateShapeMismatch;
+            arrays[i] = arr;
+        }
+        const vec = mlx.mlx_vector_array_new_data(arrays.ptr, arrays.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 0, self.s));
         return out;
     }
 
@@ -10802,8 +10880,33 @@ pub const Transformer = struct {
             if (e.ssm_state.ctx != null) _ = mlx.mlx_array_free(e.ssm_state);
             e.ssm_state = ssm_own;
 
+            try self.splitOptionalSsmArray(m.aux_state, &e.aux_state, i_c);
+            try self.splitOptionalSsmArray(m.qsa_pooled, &e.qsa_pooled, i_c);
+            e.qsa_ratio = m.qsa_ratio;
+            e.qsa_len = m.qsa_len;
+
             e.initialized = true;
         }
+    }
+
+    fn splitOptionalSsmArray(self: *Transformer, merged: mlx.mlx_array, dst: *mlx.mlx_array, row: c_int) !void {
+        if (merged.ctx == null) {
+            if (dst.ctx != null) _ = mlx.mlx_array_free(dst.*);
+            dst.* = .{ .ctx = null };
+            return;
+        }
+        const shape = mlx.getShape(merged);
+        if (shape.len != 3 or row < 0 or row >= shape[0]) return error.Qwen4BatchStateShapeMismatch;
+        var view = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(view);
+        const start = [_]c_int{ row, 0, 0 };
+        const stop = [_]c_int{ row + 1, shape[1], shape[2] };
+        const strides = [_]c_int{ 1, 1, 1 };
+        try mlx.check(mlx.mlx_slice(&view, merged, &start, 3, &stop, 3, &strides, 3, self.s));
+        var own = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&own, view));
+        if (dst.ctx != null) _ = mlx.mlx_array_free(dst.*);
+        dst.* = own;
     }
 
     /// Can these slots take ONE batched GDN decode tick? Every slot must
@@ -11154,6 +11257,72 @@ pub const Transformer = struct {
         };
     }
 
+    /// Hash all lanes from one contiguous `[B,S]` token tensor and start at
+    /// most one combined disk ticket. The caller must keep `ctxs` in this
+    /// exact order through finish and state split.
+    fn preparePleEmbeddingBatch(self: *Transformer, token_ids: mlx.mlx_array, ctxs: []const *ForwardCtx, layer: usize, seq_len: c_int) !PleBatchPrefetch {
+        if (ctxs.len < 2 or self.spec_capture_ssm) return error.Qwen4BatchUnsupported;
+        const st = self.qwen4.?;
+        const shape = mlx.getShape(token_ids);
+        if (shape.len != 2 or shape[0] != @as(c_int, @intCast(ctxs.len)) or shape[1] != seq_len)
+            return error.Qwen4BatchTokenShapeMismatch;
+
+        var ids_i32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ids_i32);
+        try mlx.check(mlx.mlx_astype(&ids_i32, token_ids, .int32, self.s));
+        var ids_c = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ids_c);
+        try mlx.check(mlx.mlx_contiguous(&ids_c, ids_i32, false, self.s));
+        try mlx.check(mlx.mlx_array_eval(ids_c));
+
+        const B = ctxs.len;
+        const S: usize = @intCast(seq_len);
+        const ctx_len = st.hash.ngram_size - 1;
+        const ids = try self.allocator.alloc(u32, B * S);
+        errdefer self.allocator.free(ids);
+        const rows = try self.allocator.alloc(i64, B * S * st.hash.n_heads);
+        errdefer self.allocator.free(rows);
+        const prevs = try self.allocator.alloc([8]u32, B);
+        errdefer self.allocator.free(prevs);
+        const src = mlx.mlx_array_data_int32(ids_c) orelse return error.TokenIdsUnreadable;
+        for (ctxs, 0..) |c, lane| {
+            const entries = c.ssm_entries orelse return error.MissingSsmEntries;
+            if (layer >= entries.len) return error.MissingSsmEntries;
+            const e = &entries[layer];
+            prevs[lane] = @splat(st.hash.eos);
+            if (e.ple_prev_valid) prevs[lane] = e.ple_prev;
+            const lane_ids = ids[lane * S ..][0..S];
+            for (lane_ids, 0..) |*dst, i| dst.* = @intCast(src[lane * S + i]);
+            const row_n = S * st.hash.n_heads;
+            st.hash.rowIds(prevs[lane][0..ctx_len], lane_ids, rows[lane * row_n ..][0..row_n]);
+        }
+        return .{
+            .allocator = self.allocator,
+            .table = &st.table,
+            .ids = ids,
+            .rows = rows,
+            .prevs = prevs,
+            .batch = B,
+            .seq_len = S,
+            .ctx_len = ctx_len,
+            .active = st.table.beginGather(rows),
+        };
+    }
+
+    fn advancePleHistory(ids: []const u32, prev: [8]u32, ctx_len: usize, entry: *SSMCacheEntry) void {
+        const tail_from: usize = if (ids.len >= ctx_len) ids.len - ctx_len else 0;
+        var k: usize = 0;
+        if (ids.len < ctx_len) {
+            for (0..ctx_len - ids.len) |i| entry.ple_prev[i] = prev[ids.len + i];
+            k = ctx_len - ids.len;
+        }
+        for (tail_from..ids.len) |i| {
+            entry.ple_prev[k] = ids[i];
+            k += 1;
+        }
+        entry.ple_prev_valid = true;
+    }
+
     /// Join a prepared gather, advance the two-token PLE history, and upload
     /// `[1,S,ple_embed_dim]` as bf16. A non-prefetched width uses the existing
     /// synchronous gather unchanged.
@@ -11173,18 +11342,7 @@ pub const Transformer = struct {
         }
         if (diagEnvOn("QWEN4_PROFILE_FWD")) log.info("[qwen4-prof] ple gather S={d}: {d:.2} ms\n", .{ seq_len, @as(f64, @floatFromInt(gclk.lap())) / 1e6 });
         // Advance the history: the last ctx_len tokens of prev ++ ids.
-        const tail_from: usize = if (n >= prep.ctx_len) n - prep.ctx_len else 0;
-        var k: usize = 0;
-        if (n < prep.ctx_len) {
-            // Shift the old history left and append everything.
-            for (0..prep.ctx_len - n) |i| entry.ple_prev[i] = prep.prev[n + i];
-            k = prep.ctx_len - n;
-        }
-        for (tail_from..n) |i| {
-            entry.ple_prev[k] = prep.ids[i];
-            k += 1;
-        }
-        entry.ple_prev_valid = true;
+        advancePleHistory(prep.ids, prep.prev, prep.ctx_len, entry);
 
         // Pack bf16 on the host (RNE) so the upload is one copy — no
         // mid-graph eval, no GPU sync inside the layer loop.
@@ -11208,12 +11366,70 @@ pub const Transformer = struct {
         return mlx.mlx_array_new_data(pk.ptr, &shape, 3, .bfloat16);
     }
 
+    /// Finish one combined gather and upload exactly one `[B,S,E]` tensor.
+    /// History commits only after every lane has been gathered and packed, so
+    /// an allocation/read failure cannot advance a strict subset of slots.
+    fn finishPleEmbeddingBatch(self: *Transformer, prep: *PleBatchPrefetch, ctxs: []const *ForwardCtx, layer: usize) !mlx.mlx_array {
+        if (ctxs.len != prep.batch or prep.ids.len != prep.batch * prep.seq_len)
+            return error.Qwen4BatchTokenShapeMismatch;
+        const st = self.qwen4.?;
+        const emb_dim = st.table.dim * st.hash.n_heads;
+        const lane_elems = prep.seq_len * emb_dim;
+        const total_elems = prep.batch * lane_elems;
+
+        if (std.c.getenv("QWEN4_PLE_GPU_CAST") != null) {
+            const host = try self.allocator.alloc(f32, total_elems);
+            defer self.allocator.free(host);
+            if (prep.active) {
+                const ok = st.table.finishGather(prep.rows, host);
+                prep.active = false;
+                if (!ok) st.table.gather(prep.rows, host);
+            } else st.table.gather(prep.rows, host);
+            const shape = [_]c_int{ @intCast(prep.batch), @intCast(prep.seq_len), @intCast(emb_dim) };
+            const f32_arr = mlx.mlx_array_new_data(host.ptr, &shape, 3, .float32);
+            defer _ = mlx.mlx_array_free(f32_arr);
+            var out = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&out, f32_arr, .bfloat16, self.s));
+            try mlx.check(mlx.mlx_array_eval(out));
+            for (ctxs, 0..) |c, lane| advancePleHistory(prep.ids[lane * prep.seq_len ..][0..prep.seq_len], prep.prevs[lane], prep.ctx_len, &c.ssm_entries.?[layer]);
+            return out;
+        }
+
+        const pk = try self.allocator.alloc(u16, total_elems);
+        defer self.allocator.free(pk);
+        if (prep.active) {
+            // Async tickets are capped to a small combined row count, so this
+            // temporary remains tiny. Wide prefill takes the scratch-reuse arm.
+            const host = try self.allocator.alloc(f32, total_elems);
+            defer self.allocator.free(host);
+            const ok = st.table.finishGather(prep.rows, host);
+            prep.active = false;
+            if (!ok) st.table.gather(prep.rows, host);
+            for (host, 0..) |v, i| {
+                const u: u32 = @bitCast(v);
+                pk[i] = @intCast((u +% 0x7FFF +% ((u >> 16) & 1)) >> 16);
+            }
+        } else {
+            const scratch = try self.allocator.alloc(f32, lane_elems);
+            defer self.allocator.free(scratch);
+            const rows_per_lane = prep.seq_len * st.hash.n_heads;
+            for (0..prep.batch) |lane| {
+                st.table.gather(prep.rows[lane * rows_per_lane ..][0..rows_per_lane], scratch);
+                for (scratch, 0..) |v, i| {
+                    const u: u32 = @bitCast(v);
+                    pk[lane * lane_elems + i] = @intCast((u +% 0x7FFF +% ((u >> 16) & 1)) >> 16);
+                }
+            }
+        }
+        const shape = [_]c_int{ @intCast(prep.batch), @intCast(prep.seq_len), @intCast(emb_dim) };
+        const out = mlx.mlx_array_new_data(pk.ptr, &shape, 3, .bfloat16);
+        for (ctxs, 0..) |c, lane| advancePleHistory(prep.ids[lane * prep.seq_len ..][0..prep.seq_len], prep.prevs[lane], prep.ctx_len, &c.ssm_entries.?[layer]);
+        return out;
+    }
+
     /// Qwen4ExpTextPLELayer.forward → the `[B,S,hc*hidden]` addend.
     fn pleForward(self: *Transformer, stream: mlx.mlx_array, token_ids: mlx.mlx_array, pw: *const PleWeights, entry: *SSMCacheEntry, batch: c_int, seq_len: c_int, prepared: ?*PleHostPrefetch) !mlx.mlx_array {
         if (batch != 1) return error.Qwen4BatchUnsupported;
-        const cfg = &self.config;
-        const hc: c_int = @intCast(cfg.hc_count);
-        const hidden: c_int = @intCast(cfg.hidden_size);
         var local: ?PleHostPrefetch = null;
         defer if (local) |*p| p.deinit();
         const prep = prepared orelse blk: {
@@ -11222,6 +11438,18 @@ pub const Transformer = struct {
         };
         const emb = try self.finishPleEmbedding(prep, entry, seq_len);
         defer _ = mlx.mlx_array_free(emb);
+        return self.pleForwardEmbedded(stream, emb, pw, entry, batch, seq_len);
+    }
+
+    /// Batch-generic Metal half of PLE. Host n-gram lookup deliberately lives
+    /// outside this function: an equal-length multi-request cohort must hash
+    /// and update token history per lane, then concatenate the resulting
+    /// embeddings to `[B,S,E]`. Once that boundary is crossed every PLE
+    /// projection and the grouped causal convolution already operates on B.
+    fn pleForwardEmbedded(self: *Transformer, stream: mlx.mlx_array, emb: mlx.mlx_array, pw: *const PleWeights, entry: *SSMCacheEntry, batch: c_int, seq_len: c_int) !mlx.mlx_array {
+        const cfg = &self.config;
+        const hc: c_int = @intCast(cfg.hc_count);
+        const hidden: c_int = @intCast(cfg.hidden_size);
         if (qwen4_trace) |tr| Qwen4Trace.set(&tr.ple_emb, emb);
 
         const key_raw = try self.qmatmul(emb, pw.key_w, pw.key_s, pw.key_b);
@@ -37531,4 +37759,83 @@ test "ssm checkpoint carries the qwen4_exp aux state (key history, pooled keys, 
     _ = mlx.mlx_array_free(src_e[0].aux_state);
     src_e[0].aux_state = .{ .ctx = null };
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(dst[0].aux_state, cp.layers[0].aux_state, s));
+}
+
+test "qwen4 batch state merge and split preserves GDN PLE and QSA lanes" {
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0xB47C_5A7E);
+    const rnd = prng.random();
+    var lanes: [2][1]SSMCacheEntry = undefined;
+    for (&lanes, 0..) |*lane, i| {
+        lane[0] = .{
+            .conv_state = try attn256RandBf16(rnd, &[_]c_int{ 1, 3, 12 }, s),
+            .ssm_state = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, 4, 5 }, s),
+            .initialized = true,
+            .aux_state = try attn256RandBf16(rnd, &[_]c_int{ 1, 7, 9 }, s),
+            .qsa_pooled = try attn256RandBf16(rnd, &[_]c_int{ 1, 4, 9 }, s),
+            .qsa_ratio = 4,
+            .qsa_len = 19,
+            .ple_prev = if (i == 0) .{ 11, 12, 0, 0, 0, 0, 0, 0 } else .{ 21, 22, 0, 0, 0, 0, 0, 0 },
+            .ple_prev_valid = true,
+        };
+    }
+    defer for (&lanes) |*lane| {
+        _ = mlx.mlx_array_free(lane[0].conv_state);
+        _ = mlx.mlx_array_free(lane[0].ssm_state);
+        _ = mlx.mlx_array_free(lane[0].aux_state);
+        _ = mlx.mlx_array_free(lane[0].qsa_pooled);
+    };
+
+    var before = [_]SSMCacheEntrySnapshot{ ssmSnapshot(&lanes[0][0]), ssmSnapshot(&lanes[1][0]) };
+    defer for (&before) |*snap| ssmSnapshotDeinit(snap);
+
+    // These helpers intentionally touch only allocator/stream, so a tiny
+    // shell transformer keeps this a cheap state-contract test.
+    var tr: Transformer = undefined;
+    tr.allocator = testing.allocator;
+    tr.s = s;
+    var ctx0: ForwardCtx = undefined;
+    var ctx1: ForwardCtx = undefined;
+    ctx0.ssm_entries = lanes[0][0..];
+    ctx1.ssm_entries = lanes[1][0..];
+    const ctxs = [_]*ForwardCtx{ &ctx0, &ctx1 };
+
+    var merged = try tr.mergeSsmAcrossSlots(&ctxs, 0);
+    defer {
+        _ = mlx.mlx_array_free(merged.conv_state);
+        _ = mlx.mlx_array_free(merged.ssm_state);
+        _ = mlx.mlx_array_free(merged.aux_state);
+        _ = mlx.mlx_array_free(merged.qsa_pooled);
+    }
+    try testing.expectEqual(@as(c_int, 2), mlx.getShape(merged.conv_state)[0]);
+    try testing.expectEqual(@as(c_int, 2), mlx.getShape(merged.ssm_state)[0]);
+    try testing.expectEqual(@as(c_int, 2), mlx.getShape(merged.aux_state)[0]);
+    try testing.expectEqual(@as(c_int, 2), mlx.getShape(merged.qsa_pooled)[0]);
+    try tr.splitSsmToSlots(&merged, &ctxs, 0);
+
+    for (&lanes, 0..) |*lane, i| {
+        try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(lane[0].conv_state, before[i].conv_state, s));
+        try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(lane[0].ssm_state, before[i].ssm_state, s));
+        try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(lane[0].aux_state, before[i].aux_state, s));
+        try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(lane[0].qsa_pooled, before[i].qsa_pooled, s));
+        try testing.expectEqual(@as(usize, 19), lane[0].qsa_len);
+        try testing.expectEqual(@as(u32, if (i == 0) 11 else 21), lane[0].ple_prev[0]);
+        try testing.expect(lane[0].ple_prev_valid);
+    }
+}
+
+test "qwen4 batched PLE history advances independently for short and wide lanes" {
+    var a: SSMCacheEntry = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+    var b: SSMCacheEntry = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+    defer {
+        _ = mlx.mlx_array_free(a.conv_state);
+        _ = mlx.mlx_array_free(a.ssm_state);
+        _ = mlx.mlx_array_free(b.conv_state);
+        _ = mlx.mlx_array_free(b.ssm_state);
+    }
+    Transformer.advancePleHistory(&[_]u32{31}, .{ 11, 12, 0, 0, 0, 0, 0, 0 }, 2, &a);
+    Transformer.advancePleHistory(&[_]u32{ 41, 42, 43 }, .{ 21, 22, 0, 0, 0, 0, 0, 0 }, 2, &b);
+    try testing.expectEqualSlices(u32, &[_]u32{ 12, 31 }, a.ple_prev[0..2]);
+    try testing.expectEqualSlices(u32, &[_]u32{ 42, 43 }, b.ple_prev[0..2]);
+    try testing.expect(a.ple_prev_valid and b.ple_prev_valid);
 }
