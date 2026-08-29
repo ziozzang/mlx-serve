@@ -853,6 +853,14 @@ pub const ModelConfig = struct {
         return true;
     }
 
+    /// The scheduler may keep several per-request slots live even though the
+    /// architecture cannot use a single batched forward. qwen4_exp keeps its
+    /// trunk and native-MTP histories per slot and safely interleaves serial
+    /// ticks on the inference thread.
+    pub fn supportsConcurrentSerialDecode(self: *const ModelConfig) bool {
+        return self.isQwen4();
+    }
+
     /// True when the trunk uses the Gemma 4 layer structure (dual FFN with
     /// shared-expert branch, sigma-MoE router, 7 norms, layer_scalar, v_norm,
     /// proportional RoPE on full layers). DiffusionGemma reuses the Gemma 4

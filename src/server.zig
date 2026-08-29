@@ -1276,12 +1276,16 @@ pub fn serve(
         // the arch list here, or this site silently disables batching that
         // the scheduler is willing to do.
         if (!config.supportsBatchedGdnDecode() and
+            !config.supportsConcurrentSerialDecode() and
             (config.has_hybrid_layers or config.full_attention_interval > 0 or config.is_encoder_only or config.isMoe()))
         {
             log.info("Concurrency: requested {d} but model is hybrid/MoE/encoder; falling back to 1\n", .{max_concurrent});
             max_concurrent = 1;
         } else {
-            log.info("Concurrency: --max-concurrent={d} (continuous batching enabled)\n", .{max_concurrent});
+            if (config.supportsConcurrentSerialDecode())
+                log.info("Concurrency: --max-concurrent={d} (per-slot serial interleave enabled)\n", .{max_concurrent})
+            else
+                log.info("Concurrency: --max-concurrent={d} (continuous batching enabled)\n", .{max_concurrent});
             if (prefix_cache_capacity < max_concurrent) prefix_cache_capacity = max_concurrent;
         }
     }

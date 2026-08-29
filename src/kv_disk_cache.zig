@@ -521,6 +521,12 @@ pub const DiskTier = struct {
                 l.ple_prev_valid = d[0] != 0;
                 for (0..8) |i| l.ple_prev[i] = d[1 + i];
             }
+            const qlen_key = try std.fmt.allocPrint(self.allocator, "l{d}.qsa_len\x00", .{li});
+            defer self.allocator.free(qlen_key);
+            var qlen_c: [*:0]const u8 = undefined;
+            if (mlx.mlx_map_string_to_string_get(&qlen_c, meta_map, @ptrCast(qlen_key.ptr)) == 0) {
+                l.qsa_len = std.fmt.parseInt(usize, std.mem.span(qlen_c), 10) catch return error.DiskCacheCorruptSsm;
+            }
         }
         var ratio_c: [*:0]const u8 = undefined;
         if (mlx.mlx_map_string_to_string_get(&ratio_c, meta_map, "qsa_ratio") == 0) {
@@ -809,9 +815,8 @@ pub const DiskTier = struct {
         const wrote_mb = @as(f64, @floatFromInt(written_bytes)) / (1024.0 * 1024.0);
         const ms: u64 = sw.read() / std.time.ns_per_ms;
         log.info("  [disk-cache] persisted {d}/{d} tokens (+{d} chunks, {d} ssm-cp, {d:.1} MB, {d}ms); resident={d:.1} MB ({d} entries)\n", .{
-            kv_len,               kv_target,          chunks_done - keep, new_entry.ssm_positions.len, wrote_mb, ms,
-            @as(f64, @floatFromInt(self.total_bytes)) / (1024.0 * 1024.0),
-            self.entries.items.len,
+            kv_len,                                                        kv_target,              chunks_done - keep, new_entry.ssm_positions.len, wrote_mb, ms,
+            @as(f64, @floatFromInt(self.total_bytes)) / (1024.0 * 1024.0), self.entries.items.len,
         });
         return complete;
     }
@@ -1318,6 +1323,13 @@ pub const DiskTier = struct {
                 const rs = try std.fmt.bufPrint(&ratio_buf, "{d}\x00", .{l.qsa_ratio});
                 try mlx.check(mlx.mlx_map_string_to_string_insert(meta_map, "qsa_ratio", @ptrCast(rs.ptr)));
                 ratio_written = true;
+            }
+            if (l.qsa_len > 0) {
+                const qlen_key = try std.fmt.allocPrint(self.allocator, "l{d}.qsa_len\x00", .{li});
+                defer self.allocator.free(qlen_key);
+                const qlen_val = try std.fmt.allocPrint(self.allocator, "{d}\x00", .{l.qsa_len});
+                defer self.allocator.free(qlen_val);
+                try mlx.check(mlx.mlx_map_string_to_string_insert(meta_map, @ptrCast(qlen_key.ptr), @ptrCast(qlen_val.ptr)));
             }
         }
 
@@ -2375,6 +2387,7 @@ test "DiskTier: hybrid entry round-trips SSM checkpoints (Phase 3)" {
     src256[2].aux_state = makeArange(s, &aux_shape, 700.0);
     src256[2].qsa_pooled = makeArange(s, &pooled_shape, 800.0);
     src256[2].qsa_ratio = 4;
+    src256[2].qsa_len = 256;
     src256[1].ple_prev = .{ 42, 43, 0, 0, 0, 0, 0, 0 };
     src256[1].ple_prev_valid = true;
     var cps = [_]transformer_mod.SSMCheckpoint{
@@ -2425,6 +2438,7 @@ test "DiskTier: hybrid entry round-trips SSM checkpoints (Phase 3)" {
     try testing.expectEqual(@as(f32, 700.0 + 5.0), ssmArrVal(dst[2].aux_state, 5, s));
     try testing.expectEqual(@as(f32, 800.0 + 11.0), ssmArrVal(dst[2].qsa_pooled, 11, s));
     try testing.expectEqual(@as(c_int, 4), dst[2].qsa_ratio);
+    try testing.expectEqual(@as(usize, 256), dst[2].qsa_len);
     try testing.expect(dst[1].ple_prev_valid and dst[1].ple_prev[0] == 42 and dst[1].ple_prev[1] == 43);
     try testing.expect(!dst[0].ple_prev_valid and dst[0].aux_state.ctx == null);
 

@@ -3891,6 +3891,9 @@ pub const SSMCacheEntry = struct {
     /// complete blocks of `aux_state`, extended incrementally per forward.
     qsa_pooled: mlx.mlx_array = .{ .ctx = null },
     qsa_ratio: c_int = 4,
+    /// Absolute number of QSA key rows represented by aux_state + pooled.
+    /// aux_state may retain only a rolling raw tail after sparse QSA engages.
+    qsa_len: usize = 0,
 };
 
 /// SSM snapshot value. Holds clones of conv_state and ssm_state via refcount —
@@ -3908,6 +3911,7 @@ pub const SSMCacheEntrySnapshot = struct {
     aux_state: mlx.mlx_array = .{ .ctx = null },
     qsa_pooled: mlx.mlx_array = .{ .ctx = null },
     qsa_ratio: c_int = 4,
+    qsa_len: usize = 0,
     ple_prev: [8]u32 = @splat(0),
     ple_prev_valid: bool = false,
 };
@@ -3951,6 +3955,7 @@ pub fn ssmSnapshot(src: *const SSMCacheEntry) SSMCacheEntrySnapshot {
         _ = mlx.mlx_array_set(&out.qsa_pooled, src.qsa_pooled);
     }
     out.qsa_ratio = src.qsa_ratio;
+    out.qsa_len = src.qsa_len;
     out.ple_prev = src.ple_prev;
     out.ple_prev_valid = src.ple_prev_valid;
     return out;
@@ -3994,6 +3999,7 @@ pub fn ssmRestore(dst: *SSMCacheEntry, snap: *const SSMCacheEntrySnapshot) !void
         try mlx.check(mlx.mlx_array_set(&dst.qsa_pooled, snap.qsa_pooled));
     }
     dst.qsa_ratio = snap.qsa_ratio;
+    dst.qsa_len = snap.qsa_len;
     dst.ple_prev = snap.ple_prev;
     dst.ple_prev_valid = snap.ple_prev_valid;
 }
@@ -4064,6 +4070,7 @@ pub fn ssmRollbackFromCapture(entry: *SSMCacheEntry, accepted: u32, verify_len: 
     } else if (entry.aux_state.ctx != null and entry.conv_state.ctx == null) {
         const ks = mlx.getShape(entry.aux_state); // [B, rows, hd]
         const keep: c_int = ks[1] - @as(c_int, @intCast(verify_len)) + @as(c_int, @intCast(1 + accepted));
+        const keep_total: usize = entry.qsa_len - verify_len + 1 + accepted;
         const start = [_]c_int{ 0, 0, 0 };
         const stop = [_]c_int{ ks[0], keep, ks[2] };
         const strides = [_]c_int{ 1, 1, 1 };
@@ -4073,7 +4080,8 @@ pub fn ssmRollbackFromCapture(entry: *SSMCacheEntry, accepted: u32, verify_len: 
         const owned = try materializedOwnedCopy(s, view);
         _ = mlx.mlx_array_free(entry.aux_state);
         entry.aux_state = owned;
-        try truncatePooled(&entry.qsa_pooled, keep, entry.qsa_ratio, s);
+        try truncatePooled(&entry.qsa_pooled, @intCast(keep_total), entry.qsa_ratio, s);
+        entry.qsa_len = keep_total;
     }
     if (entry.spec_state_seq.ctx == null and entry.spec_conv_input.ctx == null) return;
 
@@ -4216,6 +4224,7 @@ pub fn captureSsmCheckpoint(
         if (src.aux_state.ctx != null) out.aux_state = try materializedOwnedCopy(s, src.aux_state);
         if (src.qsa_pooled.ctx != null) out.qsa_pooled = try materializedOwnedCopy(s, src.qsa_pooled);
         out.qsa_ratio = src.qsa_ratio;
+        out.qsa_len = src.qsa_len;
         out.ple_prev = src.ple_prev;
         out.ple_prev_valid = src.ple_prev_valid;
         layers[i] = out;
@@ -4528,12 +4537,26 @@ const Qwen4Mtp = struct {
     fc_hid_b: mlx.mlx_array,
     mixer: HcWeights,
     owned: []mlx.mlx_array,
+    /// Compatibility runtime used by fixture tests and direct callers. Live
+    /// generators allocate their own runtime so sessions never share history.
+    runtime: Qwen4MtpRuntime,
+};
+
+pub const Qwen4MtpRuntime = struct {
     cache: KVCache,
     entry: SSMCacheEntry,
     seq_offset: usize = 0,
     /// Absolute position of the head's key row 0 (the first draft position
     /// after a reset).
     pos_base: c_int = 0,
+
+    pub fn deinit(self: *Qwen4MtpRuntime) void {
+        self.cache.deinit();
+        _ = mlx.mlx_array_free(self.entry.conv_state);
+        _ = mlx.mlx_array_free(self.entry.ssm_state);
+        if (self.entry.aux_state.ctx != null) _ = mlx.mlx_array_free(self.entry.aux_state);
+        if (self.entry.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(self.entry.qsa_pooled);
+    }
 };
 
 const LinearAttnWeights = struct {
@@ -7750,11 +7773,7 @@ pub const Transformer = struct {
         if (self.qwen4_mtp) |*m| {
             for (m.owned) |a| _ = mlx.mlx_array_free(a);
             self.allocator.free(m.owned);
-            m.cache.deinit();
-            _ = mlx.mlx_array_free(m.entry.conv_state);
-            _ = mlx.mlx_array_free(m.entry.ssm_state);
-            if (m.entry.aux_state.ctx != null) _ = mlx.mlx_array_free(m.entry.aux_state);
-            if (m.entry.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(m.entry.qsa_pooled);
+            m.runtime.deinit();
             self.qwen4_mtp = null;
         }
         if (self.qwen4) |st| {
@@ -9069,7 +9088,7 @@ pub const Transformer = struct {
     /// slot deinits and rebuilds the live request's state and both then append
     /// to the ONE state. Add a new arm here the moment its pointer field is
     /// added above, or the arch serves two clients one mangled stream.
-    pub const module_owned_state_fields = [_][]const u8{ "dsv4", "qwen4" };
+    pub const module_owned_state_fields = [_][]const u8{"dsv4"};
 
     pub fn ownsModuleDecodeState(self: *const Transformer) bool {
         inline for (module_owned_state_fields) |f| {
@@ -11360,7 +11379,7 @@ pub const Transformer = struct {
     /// coordinates; RoPE angles use absolute positions — the SAME M-RoPE table
     /// as attention on an image request (queries from the chunk's cos/sin,
     /// pooled block keys at 3-D block-start positions), scalar rope otherwise.
-    fn qsaMask(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int) !mlx.mlx_array {
+    fn qsaMask(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int, compact_raw: bool) !mlx.mlx_array {
         const offset = cache_len;
         const cfg = &self.config;
         const n_idx: c_int = @intCast(cfg.indexer_n_heads);
@@ -11377,6 +11396,8 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(k_raw);
         try mlx.check(mlx.mlx_slice(&k_raw, qk, &[_]c_int{ 0, 0, n_idx * idx_hd }, 3, &[_]c_int{ batch, seq_len, (n_idx + 1) * idx_hd }, 3, &strides3, 3, self.s));
         // Key history [B, kv, hd] (materialized: k_raw is a view of qk).
+        const prior_raw_len: c_int = if (entry.aux_state.ctx != null) mlx.getShape(entry.aux_state)[1] else 0;
+        const raw_base = offset - prior_raw_len;
         var keys = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(keys);
         if (entry.aux_state.ctx != null) {
@@ -11388,12 +11409,14 @@ pub const Transformer = struct {
             _ = mlx.mlx_array_free(keys);
             keys = try materializedOwnedCopy(self.s, k_raw);
         }
-        if (entry.aux_state.ctx != null) _ = mlx.mlx_array_free(entry.aux_state);
-        entry.aux_state = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_array_set(&entry.aux_state, keys));
-
         const kv: c_int = offset + seq_len;
-        if (kv <= budget + ratio - 1) return mlx.mlx_array_new(); // every block fits: dense
+        entry.qsa_len = @intCast(kv);
+        if (kv <= budget + ratio - 1) {
+            if (entry.aux_state.ctx != null) _ = mlx.mlx_array_free(entry.aux_state);
+            entry.aux_state = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&entry.aux_state, keys));
+            return mlx.mlx_array_new(); // every block fits: dense
+        }
         if (batch != 1) return error.Qwen4BatchUnsupported;
         if (!qsa_engaged_logged) {
             qsa_engaged_logged = true;
@@ -11439,7 +11462,13 @@ pub const Transformer = struct {
             const n_new = nb - nb_cached;
             var kb_flat = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(kb_flat);
-            try mlx.check(mlx.mlx_slice(&kb_flat, keys, &[_]c_int{ 0, nb_cached * ratio, 0 }, 3, &[_]c_int{ batch, nb * ratio, idx_hd }, 3, &strides3, 3, self.s));
+            const local_start = nb_cached * ratio - raw_base;
+            const local_stop = nb * ratio - raw_base;
+            if (local_start < 0) {
+                log.warn("[qsa-window] pool miss: offset={d} raw={d} base={d} nb_cached={d} nb={d} qsa_len={d}\n", .{ offset, prior_raw_len, raw_base, nb_cached, nb, entry.qsa_len });
+                return error.Qwen4QsaPoolWindowTooShort;
+            }
+            try mlx.check(mlx.mlx_slice(&kb_flat, keys, &[_]c_int{ 0, local_start, 0 }, 3, &[_]c_int{ batch, local_stop, idx_hd }, 3, &strides3, 3, self.s));
             const kb_shape = [_]c_int{ batch, n_new, ratio, idx_hd };
             var kb4 = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(kb4);
@@ -11481,6 +11510,25 @@ pub const Transformer = struct {
             }
             entry.qsa_pooled = merged;
         }
+        // Pooled keys are the durable representation of complete blocks. Keep
+        // only a bounded raw tail for completing the next block and for the
+        // largest speculative rollback; this removes the O(context) concat
+        // and ~768 MiB raw QSA residency at 262K on this 12-attention trunk.
+        const key_rows = mlx.getShape(keys)[1];
+        // Compact prompt chunks, but leave decode/verify widths untrimmed:
+        // speculative rollback must retain the raw rows that preceded the
+        // verify. The tail therefore grows only with generated tokens. The
+        // native MTP controller may jump to an older deferred stash origin,
+        // so its single layer retains full raw history as well.
+        const raw_cap = if (compact_raw and seq_len > 32) budget + ratio - 1 else key_rows;
+        const keep_raw = @min(key_rows, raw_cap);
+        const raw_tail_start = key_rows - keep_raw;
+        var raw_tail_view = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(raw_tail_view);
+        try mlx.check(mlx.mlx_slice(&raw_tail_view, keys, &[_]c_int{ 0, raw_tail_start, 0 }, 3, &[_]c_int{ batch, key_rows, idx_hd }, 3, &strides3, 3, self.s));
+        const raw_tail = try materializedOwnedCopy(self.s, raw_tail_view);
+        if (entry.aux_state.ctx != null) _ = mlx.mlx_array_free(entry.aux_state);
+        entry.aux_state = raw_tail;
         if (std.c.getenv("QWEN4_DEBUG_SCORES") != null) {
             const qs = mlx.getShape(entry.qsa_pooled);
             std.debug.print("[qsa] kv={d} nb={d} cached={d} pooled shape {any} keys {any}\n", .{ kv, nb, nb_cached, qs, mlx.getShape(keys) });
@@ -11655,7 +11703,7 @@ pub const Transformer = struct {
     /// `gatedFullAttnWith` (q-gate, QK norm, partial RoPE, KV cache all shared).
     fn qwen4AttnWith(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, layer: u32, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int, is_prefill: bool) !mlx.mlx_array {
         if (fa.idx_qk_w.ctx != null and !qwen4Standin().attn_qsa) {
-            ctx.qsa_mask = try self.qsaMask(ctx, x, fa, entry, cache_len, pos_base, batch, seq_len);
+            ctx.qsa_mask = try self.qsaMask(ctx, x, fa, entry, cache_len, pos_base, batch, seq_len, layer < self.config.num_hidden_layers);
         }
         if (layer == 3) if (qwen4_trace) |tr| {
             if (ctx.qsa_mask.ctx != null) Qwen4Trace.set(&tr.qsa_mask, ctx.qsa_mask);
@@ -11706,21 +11754,40 @@ pub const Transformer = struct {
             .fc_hid_b = fh.bi,
             .mixer = mixer,
             .owned = try owned.toOwnedSlice(allocator),
-            .cache = cache,
-            .entry = entry,
+            .runtime = .{ .cache = cache, .entry = entry },
         };
     }
 
-    /// Reset the MTP head's per-request state (KV, indexer keys, position).
+    /// Allocate independent draft-head history for one live Generator.
+    pub fn qwen4MtpMakeRuntime(self: *Transformer, allocator: std.mem.Allocator) !Qwen4MtpRuntime {
+        if (self.qwen4_mtp == null) return error.NoMtpHead;
+        const cache = try KVCache.init(allocator, self.config.num_hidden_layers + 1);
+        return .{
+            .cache = cache,
+            .entry = .{
+                .conv_state = mlx.mlx_array_new(),
+                .ssm_state = mlx.mlx_array_new(),
+                .initialized = false,
+            },
+            .pos_base = -1,
+        };
+    }
+
+    fn qwen4MtpResetRuntime(self: *Transformer, runtime: *Qwen4MtpRuntime) !void {
+        try runtime.cache.reinit(self.config.num_hidden_layers + 1, runtime.cache.config, self.config.kvCacheKeyHeadDim());
+        if (runtime.entry.aux_state.ctx != null) _ = mlx.mlx_array_free(runtime.entry.aux_state);
+        if (runtime.entry.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(runtime.entry.qsa_pooled);
+        runtime.entry.aux_state = .{ .ctx = null };
+        runtime.entry.qsa_pooled = .{ .ctx = null };
+        runtime.entry.qsa_len = 0;
+        runtime.seq_offset = 0;
+        runtime.pos_base = -1;
+    }
+
+    /// Reset the compatibility runtime used by direct fixture callers.
     pub fn qwen4MtpReset(self: *Transformer) !void {
         const m = &(self.qwen4_mtp orelse return);
-        try m.cache.reinit(self.config.num_hidden_layers + 1, m.cache.config, self.config.kvCacheKeyHeadDim());
-        if (m.entry.aux_state.ctx != null) _ = mlx.mlx_array_free(m.entry.aux_state);
-        if (m.entry.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(m.entry.qsa_pooled);
-        m.entry.aux_state = .{ .ctx = null };
-        m.entry.qsa_pooled = .{ .ctx = null };
-        m.seq_offset = 0;
-        m.pos_base = -1;
+        try self.qwen4MtpResetRuntime(&m.runtime);
     }
 
     /// MTP draft logits: `stream_prev` `[B,S,hc*H]` is the trunk's pre-mixer
@@ -11730,34 +11797,42 @@ pub const Transformer = struct {
     pub const Qwen4MtpOut = struct { logits: mlx.mlx_array, stream: mlx.mlx_array };
 
     /// Truncate the head's committed history to `len` rows.
-    pub fn qwen4MtpTruncate(self: *Transformer, len: usize) !void {
-        const m = &(self.qwen4_mtp orelse return);
-        if (len >= m.seq_offset) return;
-        try m.cache.truncate(len, self.s);
-        if (m.entry.aux_state.ctx != null) {
+    pub fn qwen4MtpTruncateRuntime(self: *Transformer, runtime: *Qwen4MtpRuntime, len: usize) !void {
+        if (len >= runtime.seq_offset) return;
+        try runtime.cache.truncate(len, self.s);
+        if (runtime.entry.aux_state.ctx != null) {
             if (len == 0) {
-                _ = mlx.mlx_array_free(m.entry.aux_state);
-                m.entry.aux_state = .{ .ctx = null };
-                if (m.entry.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(m.entry.qsa_pooled);
-                m.entry.qsa_pooled = .{ .ctx = null };
+                _ = mlx.mlx_array_free(runtime.entry.aux_state);
+                runtime.entry.aux_state = .{ .ctx = null };
+                if (runtime.entry.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(runtime.entry.qsa_pooled);
+                runtime.entry.qsa_pooled = .{ .ctx = null };
             } else {
-                const ks = mlx.getShape(m.entry.aux_state);
+                const ks = mlx.getShape(runtime.entry.aux_state);
+                const drop = runtime.seq_offset - len;
+                if (drop >= @as(usize, @intCast(ks[1]))) return error.Qwen4QsaRollbackWindowTooShort;
+                const keep_raw: c_int = ks[1] - @as(c_int, @intCast(drop));
                 const start = [_]c_int{ 0, 0, 0 };
-                const stop = [_]c_int{ ks[0], @intCast(len), ks[2] };
+                const stop = [_]c_int{ ks[0], keep_raw, ks[2] };
                 const strides = [_]c_int{ 1, 1, 1 };
                 var view = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(view);
-                try mlx.check(mlx.mlx_slice(&view, m.entry.aux_state, &start, 3, &stop, 3, &strides, 3, self.s));
+                try mlx.check(mlx.mlx_slice(&view, runtime.entry.aux_state, &start, 3, &stop, 3, &strides, 3, self.s));
                 const owned = try materializedOwnedCopy(self.s, view);
-                _ = mlx.mlx_array_free(m.entry.aux_state);
-                m.entry.aux_state = owned;
-                try truncatePooled(&m.entry.qsa_pooled, @intCast(len), m.entry.qsa_ratio, self.s);
+                _ = mlx.mlx_array_free(runtime.entry.aux_state);
+                runtime.entry.aux_state = owned;
+                try truncatePooled(&runtime.entry.qsa_pooled, @intCast(len), runtime.entry.qsa_ratio, self.s);
             }
         }
-        m.seq_offset = len;
+        runtime.entry.qsa_len = len;
+        runtime.seq_offset = len;
     }
 
-    pub fn qwen4MtpForward(self: *Transformer, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int) !Qwen4MtpOut {
+    pub fn qwen4MtpTruncate(self: *Transformer, len: usize) !void {
+        const m = &(self.qwen4_mtp orelse return);
+        try self.qwen4MtpTruncateRuntime(&m.runtime, len);
+    }
+
+    pub fn qwen4MtpForwardRuntime(self: *Transformer, runtime: *Qwen4MtpRuntime, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int) !Qwen4MtpOut {
         const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
         const cfg = &self.config;
         const hc: c_int = @intCast(cfg.hc_count);
@@ -11766,8 +11841,8 @@ pub const Transformer = struct {
         const batch: c_int = shape[0];
         const seq_len: c_int = shape[1];
         const is_prefill = seq_len > 1;
-        if (m.seq_offset == 0) m.pos_base = pos_offset;
-        if (pos_offset != m.pos_base + @as(c_int, @intCast(m.seq_offset))) return error.MtpPositionGap;
+        if (runtime.seq_offset == 0) runtime.pos_base = pos_offset;
+        if (pos_offset != runtime.pos_base + @as(c_int, @intCast(runtime.seq_offset))) return error.MtpPositionGap;
 
         var token_ids = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(token_ids);
@@ -11796,13 +11871,13 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_reshape(&h, x4, &[_]c_int{ batch, seq_len, hc * hidden }, 3, self.s));
         errdefer _ = mlx.mlx_array_free(h);
 
-        var ctx: ForwardCtx = .{ .cache = &m.cache, .moe_seq_offset = &m.seq_offset, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+        var ctx: ForwardCtx = .{ .cache = &runtime.cache, .moe_seq_offset = &runtime.seq_offset, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
         const li: u32 = cfg.num_hidden_layers;
         const lw = &m.layer;
         var pre = try self.hcRead(h, &lw.hc_attn.?, batch, seq_len);
         defer pre.deinit();
         const attn_out = switch (lw.attn) {
-            .full => |fa| try self.qwen4AttnWith(&ctx, pre.mixed, &fa, &m.entry, li, @intCast(m.seq_offset), m.pos_base, batch, seq_len, is_prefill),
+            .full => |fa| try self.qwen4AttnWith(&ctx, pre.mixed, &fa, &runtime.entry, li, @intCast(runtime.seq_offset), runtime.pos_base, batch, seq_len, is_prefill),
             .linear => return error.MtpLayerNotAttention,
         };
         defer _ = mlx.mlx_array_free(attn_out);
@@ -11815,7 +11890,7 @@ pub const Transformer = struct {
         };
         defer _ = mlx.mlx_array_free(mlp_out);
         h = try self.hcWrite(h, mlp_out, pre2.inj, batch, seq_len);
-        m.seq_offset += @intCast(seq_len);
+        runtime.seq_offset += @intCast(seq_len);
 
         const mix = try self.hcRead(h, &m.mixer, batch, seq_len);
         errdefer _ = mlx.mlx_array_free(h);
@@ -11823,6 +11898,11 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(mix.mixed);
         const logits = try self.lmHeadProject(mix.mixed, false);
         return .{ .logits = logits, .stream = h };
+    }
+
+    pub fn qwen4MtpForward(self: *Transformer, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int) !Qwen4MtpOut {
+        const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
+        return self.qwen4MtpForwardRuntime(&m.runtime, stream_prev, token_ids_in, pos_offset);
     }
 
     /// Test hook: layer-0 intermediates of the qwen4 forward (fixture bisect).
@@ -35760,8 +35840,8 @@ test "no layer-init path DEMANDS quantization scales" {
     try std.testing.expect(checked > 20); // every arch arm's scales fetches
 }
 
-test "ownsModuleDecodeState covers every module-owned arch" {
-    // The bug this pins: a SECOND module-owned arch arrived and
+test "ownsModuleDecodeState covers every mutable module-owned arch" {
+    // The bug this pins: another mutable module-owned arch arrived and
     // `scheduler.modelExclusiveDecode` kept keying on `dsv4` alone, so two
     // concurrent requests shared ONE module state — the 2026-08-02 dsv4
     // clobber, verbatim. The predicate reads a NAMED LIST so it cannot
@@ -35776,7 +35856,7 @@ test "ownsModuleDecodeState covers every module-owned arch" {
     try testing.expect(t.ownsModuleDecodeState());
 }
 
-test "every optional arch-module pointer on Transformer is a declared module-owned arch" {
+test "every mutable optional arch-module pointer is declared module-owned" {
     // Class guard, not an instance guard: a THIRD arch declared the same way
     // as the two above is module-owned by construction, and forgetting it in
     // the list is SILENT — serial decode still "works" until two clients
@@ -35799,6 +35879,9 @@ test "every optional arch-module pointer on Transformer is a declared module-own
         if (!std.mem.endsWith(u8, decl, ":")) continue;
         const name = decl[0 .. decl.len - 1];
         if (name.len == 0 or std.mem.indexOfAny(u8, name, " /(\"`") != null) continue;
+        // qwen4 owns only an immutable hash + read-only mmap table; mutable
+        // PLE/QSA state lives in each ForwardCtx and MTP runtime.
+        if (std.mem.eql(u8, name, "qwen4")) continue;
         found += 1;
         var listed = false;
         for (Transformer.module_owned_state_fields) |f| {
@@ -37056,7 +37139,7 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
             _ = mlx.mlx_array_free(a);
         };
         var stash_off0: usize = 0;
-        var off0: usize = xfm.qwen4_mtp.?.seq_offset;
+        var off0: usize = xfm.qwen4_mtp.?.runtime.seq_offset;
         var last_logits: mlx.mlx_array = .{ .ctx = null };
         defer if (last_logits.ctx != null) {
             _ = mlx.mlx_array_free(last_logits);

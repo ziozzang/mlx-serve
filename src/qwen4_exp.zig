@@ -261,7 +261,6 @@ pub const NgramTable = struct {
         };
         return std.c.pread(self.fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
     }
-
 };
 
 /// Persistent gather workers. Every row's three regions are one SSD read on
@@ -441,11 +440,8 @@ test "ngram table row dequant follows the MLX affine nibble layout" {
     try testing.expectEqual(@as(f32, 5.0), out[13]);
 }
 
-/// Module-owned state for one loaded qwen4_exp model: the n-gram hash and
-/// the mmapped table. Non-null on `Transformer.qwen4` ⇒ the arch is served
-/// serially with speculation off (`ownsModuleDecodeState`), which is what
-/// the per-request PLE/indexer state in `SSMCacheEntry.aux_state` needs
-/// until the snapshot machinery carries it.
+/// Model-owned immutable resources for qwen4_exp: the n-gram hash and the
+/// read-only mmapped table. Mutable PLE/QSA/MTP history is per request.
 pub const Qwen4State = struct {
     hash: NgramHash,
     table: NgramTable,

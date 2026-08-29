@@ -5062,14 +5062,17 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         slot.model.transformer.?.dsv4 != null;
     const module_spec_rollback = slot.model.transformer != null and
         slot.model.transformer.?.moduleStateSpecRollback();
+    const native_qwen4_mtp = slot.model.transformer != null and
+        slot.model.transformer.?.qwen4_mtp != null;
     const image_request = slot.mrope_pos != null;
-    if (owns_module_state and module_spec_rollback and image_request and slot.enable_mtp and slot.mtp != null and !mtp_image_decline_logged) {
+    if (native_qwen4_mtp and image_request and slot.enable_mtp and slot.mtp != null and !mtp_image_decline_logged) {
         mtp_image_decline_logged = true;
         log.info("[mtp] declined: image request on qwen4 (the head's QSA/rope has no M-RoPE arm; serial decode)\n", .{});
     }
     const wiring = specInitWiring(
         owns_module_state,
         module_spec_rollback,
+        native_qwen4_mtp,
         has_native_draft,
         slot.enable_mtp,
         slot.mtp != null,
@@ -5431,6 +5434,7 @@ var mtp_image_decline_logged: bool = false;
 pub fn specInitWiring(
     owns_module_state: bool,
     module_spec_rollback: bool,
+    native_qwen4_mtp: bool,
     has_native_draft: bool,
     enable_mtp: bool,
     has_mtp: bool,
@@ -5440,7 +5444,7 @@ pub fn specInitWiring(
     enable_pld: bool,
     image_request: bool,
 ) SpecInitWiring {
-    if (owns_module_state) return .{
+    if (owns_module_state or native_qwen4_mtp) return .{
         // A module-owned arch that CAN rewind its state across a verify runs
         // its own MTP head like any other target. PLD and the drafters
         // stay off regardless: the drafters need a bound sidecar (DflashModel
@@ -5450,7 +5454,7 @@ pub fn specInitWiring(
         // unmeasured spec mode is worse than none. An image request (M-RoPE
         // table) decodes serially: the qwen4 head's own QSA/rope has no
         // M-RoPE arm, so a draft there would be mis-roped.
-        .use_mtp = module_spec_rollback and enable_mtp and has_mtp and !image_request,
+        .use_mtp = (module_spec_rollback or native_qwen4_mtp) and enable_mtp and has_mtp and !image_request,
         .use_drafter = false,
         .use_dflash = false,
         .use_pld = false,
@@ -6160,6 +6164,7 @@ test "a GDN trunk is batchable AND is not clamped by the server's concurrency ga
 
     // The server's clamp condition, transcribed: it must NOT fire here.
     const server_would_clamp = !cfg.supportsBatchedGdnDecode() and
+        !cfg.supportsConcurrentSerialDecode() and
         (cfg.has_hybrid_layers or cfg.full_attention_interval > 0 or
             cfg.is_encoder_only or cfg.isMoe());
     try testing.expect(!server_would_clamp);
@@ -6555,72 +6560,72 @@ test "specInitWiring: a module-owned arch only gets the spec modes it can roll b
     // the next module-owned arch (0-layer shell cache, state on the module)
     // got none, so `--pld` drove verify forwards straight through it. The
     // predicate is now per-ARCH CAPABILITY (`moduleStateSpecRollback`), not ownership.
-    // Args: (owns_module_state, module_spec_rollback, has_native_draft,
+    // Args: (owns_module_state, module_spec_rollback, native_qwen4_mtp, has_native_draft,
     //        enable_mtp, has_mtp, enable_drafter, has_drafter, has_dflash,
     //        enable_pld)
 
     // Plain arch: today's precedence, unchanged.
     {
-        const w = specInitWiring(false, false, false, true, true, true, true, false, true, false);
+        const w = specInitWiring(false, false, false, false, true, true, true, true, false, true, false);
         try testing.expect(w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld and !w.native_intent);
     }
     {
-        const w = specInitWiring(false, false, false, true, false, true, true, false, true, false);
+        const w = specInitWiring(false, false, false, false, true, false, true, true, false, true, false);
         try testing.expect(!w.use_mtp and w.use_drafter and !w.use_pld);
     }
     {
-        const w = specInitWiring(false, false, false, false, false, false, false, false, true, false);
+        const w = specInitWiring(false, false, false, false, false, false, false, false, false, true, false);
         try testing.expect(!w.use_mtp and !w.use_drafter and w.use_pld and !w.native_intent);
     }
     // A flag with no loaded handle never arms.
     {
-        const w = specInitWiring(false, false, false, true, false, false, false, false, false, false);
+        const w = specInitWiring(false, false, false, false, true, false, false, false, false, false, false);
         try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld);
     }
 
     // DFlash rides the enable_drafter switch: MTP > dflash > drafter > PLD.
     {
-        const w = specInitWiring(false, false, false, false, false, true, false, true, true, false);
+        const w = specInitWiring(false, false, false, false, false, false, true, false, true, true, false);
         try testing.expect(!w.use_mtp and w.use_dflash and !w.use_drafter and !w.use_pld);
     }
     // A loaded MTP head still outranks it.
     {
-        const w = specInitWiring(false, false, false, true, true, true, false, true, true, false);
+        const w = specInitWiring(false, false, false, false, true, true, true, false, true, true, false);
         try testing.expect(w.use_mtp and !w.use_dflash);
     }
     // enable_drafter:false opts BOTH sidecar kinds out.
     {
-        const w = specInitWiring(false, false, false, false, false, false, false, true, true, false);
+        const w = specInitWiring(false, false, false, false, false, false, false, false, true, true, false);
         try testing.expect(!w.use_dflash and !w.use_drafter and w.use_pld);
     }
 
     // Module-owned with NO rollback and no native draft mode: everything off,
     // and no intent bit either — nothing downstream can arm a draft path.
     {
-        const w = specInitWiring(true, false, false, true, true, true, true, true, true, false);
+        const w = specInitWiring(true, false, false, false, true, true, true, true, true, true, false);
         try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld and !w.native_intent);
     }
 
     // Module-owned WITH rollback: its own MTP head arms; the shell
     // spec modes stay off because none has been measured on this family.
     {
-        const w = specInitWiring(true, true, false, true, true, true, true, true, true, false);
+        const w = specInitWiring(false, true, true, false, true, true, true, true, true, true, false);
         try testing.expect(w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld and !w.native_intent);
     }
     // Rollback capability alone never arms a head that is not loaded.
     {
-        const w = specInitWiring(true, true, false, true, false, true, true, true, true, false);
+        const w = specInitWiring(false, true, true, false, true, false, true, true, true, true, false);
         try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld);
     }
     // ...nor one the request opted out of.
     {
-        const w = specInitWiring(true, true, false, false, true, true, true, false, true, false);
+        const w = specInitWiring(false, true, true, false, false, true, true, true, false, true, false);
         try testing.expect(!w.use_mtp);
     }
     // ...nor on an image request: the qwen4 head's QSA/rope has no M-RoPE
     // arm, so a `--mtp` server answers image turns serially.
     {
-        const w = specInitWiring(true, true, false, true, true, true, true, true, true, true);
+        const w = specInitWiring(false, true, true, false, true, true, true, true, true, true, true);
         try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld);
     }
 
@@ -6628,13 +6633,13 @@ test "specInitWiring: a module-owned arch only gets the spec modes it can roll b
     // shell paths stay off, but the request's MTP intent still reaches the
     // Generator chokepoint.
     {
-        const w = specInitWiring(true, false, true, true, true, true, true, true, true, false);
+        const w = specInitWiring(true, false, false, true, true, true, true, true, true, true, false);
         try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld);
         try testing.expect(w.native_intent);
     }
     // enable_mtp:false opts out of DSpark; PLD intent alone never arms it.
     {
-        const w = specInitWiring(true, false, true, false, false, false, false, false, true, false);
+        const w = specInitWiring(true, false, false, true, false, false, false, false, false, true, false);
         try testing.expect(!w.native_intent);
     }
 }

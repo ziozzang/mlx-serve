@@ -28,6 +28,7 @@ const DrafterModel = drafter_mod.DrafterModel;
 const dflash_mod = @import("dflash.zig");
 const DflashModel = dflash_mod.DflashModel;
 const KVCache = transformer_mod.KVCache;
+const Qwen4MtpRuntime = transformer_mod.Qwen4MtpRuntime;
 
 /// Module-level overrides for prefill behavior. Defaults match the original
 /// hardcoded values; main.zig may overwrite these from CLI flags before
@@ -198,8 +199,8 @@ fn readEnvBool(name: [:0]const u8) bool {
 /// and nothing else.
 pub const MtpHeadRef = union(enum) {
     qwen: *mtp_mod.MtpModel,
-    /// qwen4_exp: the head and its history live on the Transformer
-    /// (`qwen4_mtp`, module-owned ⇒ single-flight); row r of the history is
+    /// qwen4_exp: immutable head weights live on the Transformer while each
+    /// MtpCacheRef owns its request-local history; row r of the history is
     /// (pre-mixer stream at position r, token r+1), query position r+1.
     qwen4: *Transformer,
 
@@ -207,15 +208,17 @@ pub const MtpHeadRef = union(enum) {
         return switch (self) {
             .qwen => |h| .{ .qwen = try h.makeCache(allocator) },
             .qwen4 => |t| blk: {
-                try t.qwen4MtpReset();
-                break :blk .{ .qwen4 = t };
+                break :blk .{ .qwen4 = .{
+                    .target = t,
+                    .runtime = try t.qwen4MtpMakeRuntime(allocator),
+                } };
             },
         };
     }
 
-    fn qwen4Step(t: *Transformer, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, rope_offset: c_int, want_logits: bool) !mtp_mod.StepOut {
+    fn qwen4Step(t: *Transformer, runtime: *Qwen4MtpRuntime, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, rope_offset: c_int, want_logits: bool) !mtp_mod.StepOut {
         const s = t.s;
-        const out = try t.qwen4MtpForward(hidden, id_arr, rope_offset + 1);
+        const out = try t.qwen4MtpForwardRuntime(runtime, hidden, id_arr, rope_offset + 1);
         defer _ = mlx.mlx_array_free(out.logits);
         const hs = mlx.getShape(out.stream);
         if (!want_logits) return .{ .logits = .{ .ctx = null }, .hidden_next = out.stream };
@@ -245,7 +248,7 @@ pub const MtpHeadRef = union(enum) {
     ) !mtp_mod.StepOut {
         return switch (self) {
             .qwen => |h| mtp_mod.forwardWithMrope(h, target, &cache.qwen, id_arr, hidden, rope_offset, want_logits, mrope_ctx),
-            .qwen4 => |t| qwen4Step(t, id_arr, hidden, rope_offset, want_logits),
+            .qwen4 => |t| qwen4Step(t, &cache.qwen4.runtime, id_arr, hidden, rope_offset, want_logits),
         };
     }
 
@@ -269,7 +272,7 @@ pub const MtpHeadRef = union(enum) {
                 const shape = [_]c_int{@intCast(token_ids.len)};
                 const id_arr = mlx.mlx_array_new_data(ids_i32.ptr, &shape, 1, .int32);
                 defer _ = mlx.mlx_array_free(id_arr);
-                const out = try qwen4Step(t, id_arr, hidden, rope_offset, false);
+                const out = try qwen4Step(t, &cache.qwen4.runtime, id_arr, hidden, rope_offset, false);
                 _ = mlx.mlx_array_free(out.hidden_next);
             },
         }
@@ -329,12 +332,15 @@ pub const MtpHeadRef = union(enum) {
 /// The head's committed-history cache.
 pub const MtpCacheRef = union(enum) {
     qwen: KVCache,
-    qwen4: *Transformer,
+    qwen4: struct {
+        target: *Transformer,
+        runtime: Qwen4MtpRuntime,
+    },
 
     pub fn step(self: *const MtpCacheRef) usize {
         return switch (self.*) {
             .qwen => |*c| c.step,
-            .qwen4 => |t| t.qwen4_mtp.?.seq_offset,
+            .qwen4 => |*q| q.runtime.seq_offset,
         };
     }
 
@@ -353,14 +359,14 @@ pub const MtpCacheRef = union(enum) {
     pub fn truncate(self: *MtpCacheRef, len: usize, s: mlx.mlx_stream) !void {
         switch (self.*) {
             .qwen => |*c| try c.truncate(len, s),
-            .qwen4 => |t| try t.qwen4MtpTruncate(len),
+            .qwen4 => |*q| try q.target.qwen4MtpTruncateRuntime(&q.runtime, len),
         }
     }
 
     pub fn deinit(self: *MtpCacheRef) void {
         switch (self.*) {
             .qwen => |*c| c.deinit(),
-            .qwen4 => {},
+            .qwen4 => |*q| q.runtime.deinit(),
         }
     }
 
@@ -374,7 +380,7 @@ pub const MtpCacheRef = union(enum) {
                 _ = mlx.mlx_vector_array_append_value(vec, entry.keys);
                 _ = mlx.mlx_vector_array_append_value(vec, entry.values);
             },
-            .qwen4 => |t| for (t.qwen4_mtp.?.cache.entries) |*entry| {
+            .qwen4 => |*q| for (q.runtime.cache.entries) |*entry| {
                 if (!entry.initialized) continue;
                 _ = mlx.mlx_vector_array_append_value(vec, entry.keys);
                 _ = mlx.mlx_vector_array_append_value(vec, entry.values);
