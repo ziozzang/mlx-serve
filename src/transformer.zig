@@ -10755,37 +10755,28 @@ pub const Transformer = struct {
     /// `[N, …]` entry. Both halves are concatenated on axis 0 — the batch axis
     /// the recurrence kernel already indexes with `b_idx`.
     fn mergeSsmAcrossSlots(self: *Transformer, ctxs: []const *ForwardCtx, layer: usize) !SSMCacheEntry {
-        var out: SSMCacheEntry = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = true };
+        const first = &ctxs[0].ssm_entries.?[layer];
+        var out: SSMCacheEntry = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = first.initialized };
         errdefer {
-            _ = mlx.mlx_array_free(out.conv_state);
-            _ = mlx.mlx_array_free(out.ssm_state);
+            if (out.conv_state.ctx != null) _ = mlx.mlx_array_free(out.conv_state);
+            if (out.ssm_state.ctx != null) _ = mlx.mlx_array_free(out.ssm_state);
             if (out.aux_state.ctx != null) _ = mlx.mlx_array_free(out.aux_state);
             if (out.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(out.qsa_pooled);
         }
-        const conv = try self.allocator.alloc(mlx.mlx_array, ctxs.len);
-        defer self.allocator.free(conv);
-        const ssm = try self.allocator.alloc(mlx.mlx_array, ctxs.len);
-        defer self.allocator.free(ssm);
-        for (ctxs, 0..) |c, i| {
+        for (ctxs[1..]) |c| {
             const e = &c.ssm_entries.?[layer];
-            conv[i] = e.conv_state;
-            ssm[i] = e.ssm_state;
+            if (e.initialized != out.initialized) return error.Qwen4BatchStatePresenceMismatch;
         }
-        const cvec = mlx.mlx_vector_array_new_data(conv.ptr, conv.len);
-        defer _ = mlx.mlx_vector_array_free(cvec);
-        try mlx.check(mlx.mlx_concatenate_axis(&out.conv_state, cvec, 0, self.s));
-        const svec = mlx.mlx_vector_array_new_data(ssm.ptr, ssm.len);
-        defer _ = mlx.mlx_vector_array_free(svec);
-        try mlx.check(mlx.mlx_concatenate_axis(&out.ssm_state, svec, 0, self.s));
+        out.conv_state = try self.mergeOptionalSsmArray(ctxs, layer, .conv);
+        out.ssm_state = try self.mergeOptionalSsmArray(ctxs, layer, .ssm);
 
         // Qwen4 carries two more batched arrays in the same cache entry:
         // PLE's convolution window / QSA's raw-key tail in aux_state and
         // QSA's pooled block keys.  They are absent on qwen3.5, so preserving
         // them here is a no-op for the existing decode path while making this
         // merge primitive safe for the Qwen4 equal-length batch path.
-        out.aux_state = try self.mergeOptionalSsmArray(ctxs, layer, false);
-        out.qsa_pooled = try self.mergeOptionalSsmArray(ctxs, layer, true);
-        const first = &ctxs[0].ssm_entries.?[layer];
+        out.aux_state = try self.mergeOptionalSsmArray(ctxs, layer, .aux);
+        out.qsa_pooled = try self.mergeOptionalSsmArray(ctxs, layer, .pooled);
         out.qsa_ratio = first.qsa_ratio;
         out.qsa_len = first.qsa_len;
         for (ctxs[1..]) |c| {
@@ -10799,13 +10790,25 @@ pub const Transformer = struct {
     /// Concatenate an optional rank-3 Qwen4 state on its batch axis.  A mixed
     /// present/absent cohort is never valid: it means requests are at
     /// different state boundaries and must remain serial.
-    fn mergeOptionalSsmArray(self: *Transformer, ctxs: []const *ForwardCtx, layer: usize, pooled: bool) !mlx.mlx_array {
+    const SsmArrayField = enum { conv, ssm, aux, pooled };
+
+    fn ssmArrayField(e: *const SSMCacheEntry, field: SsmArrayField) mlx.mlx_array {
+        return switch (field) {
+            .conv => e.conv_state,
+            .ssm => e.ssm_state,
+            .aux => e.aux_state,
+            .pooled => e.qsa_pooled,
+        };
+    }
+
+    fn mergeOptionalSsmArray(self: *Transformer, ctxs: []const *ForwardCtx, layer: usize, field: SsmArrayField) !mlx.mlx_array {
         const first = &ctxs[0].ssm_entries.?[layer];
-        const first_arr = if (pooled) first.qsa_pooled else first.aux_state;
+        const first_arr = ssmArrayField(first, field);
+        const rank: usize = if (field == .ssm) 4 else 3;
         if (first_arr.ctx == null) {
             for (ctxs[1..]) |c| {
                 const e = &c.ssm_entries.?[layer];
-                const arr = if (pooled) e.qsa_pooled else e.aux_state;
+                const arr = ssmArrayField(e, field);
                 if (arr.ctx != null) return error.Qwen4BatchStatePresenceMismatch;
             }
             return mlx.mlx_array_new();
@@ -10813,14 +10816,14 @@ pub const Transformer = struct {
         const arrays = try self.allocator.alloc(mlx.mlx_array, ctxs.len);
         defer self.allocator.free(arrays);
         const shape0 = mlx.getShape(first_arr);
-        if (shape0.len != 3 or shape0[0] != 1) return error.Qwen4BatchStateShapeMismatch;
+        if (shape0.len != rank or shape0[0] != 1) return error.Qwen4BatchStateShapeMismatch;
         for (ctxs, 0..) |c, i| {
             const e = &c.ssm_entries.?[layer];
-            const arr = if (pooled) e.qsa_pooled else e.aux_state;
+            const arr = ssmArrayField(e, field);
             if (arr.ctx == null) return error.Qwen4BatchStatePresenceMismatch;
             const shape = mlx.getShape(arr);
-            if (shape.len != 3 or shape[0] != 1 or shape[1] != shape0[1] or shape[2] != shape0[2])
-                return error.Qwen4BatchStateShapeMismatch;
+            if (shape.len != rank or shape[0] != 1) return error.Qwen4BatchStateShapeMismatch;
+            for (1..rank) |d| if (shape[d] != shape0[d]) return error.Qwen4BatchStateShapeMismatch;
             arrays[i] = arr;
         }
         const vec = mlx.mlx_vector_array_new_data(arrays.ptr, arrays.len);
@@ -10852,40 +10855,17 @@ pub const Transformer = struct {
     /// the rollback window closes. Bounded, but it is the same retention
     /// shape as the 3.4x hot-cache under-count.
     fn splitSsmToSlots(self: *Transformer, m: *const SSMCacheEntry, ctxs: []const *ForwardCtx, layer: usize) !void {
-        const cshape = mlx.getShape(m.conv_state);
-        const sshape = mlx.getShape(m.ssm_state);
         for (ctxs, 0..) |c, i| {
             const i_c: c_int = @intCast(i);
             var e = &c.ssm_entries.?[layer];
-
-            var conv_slice = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(conv_slice);
-            const c_start = [_]c_int{ i_c, 0, 0 };
-            const c_stop = [_]c_int{ i_c + 1, cshape[1], cshape[2] };
-            const c_str = [_]c_int{ 1, 1, 1 };
-            try mlx.check(mlx.mlx_slice(&conv_slice, m.conv_state, &c_start, 3, &c_stop, 3, &c_str, 3, self.s));
-            var conv_own = mlx.mlx_array_new();
-            _ = mlx.mlx_array_set(&conv_own, conv_slice);
-            if (e.conv_state.ctx != null) _ = mlx.mlx_array_free(e.conv_state);
-            e.conv_state = conv_own;
-
-            var ssm_slice = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(ssm_slice);
-            const s_start = [_]c_int{ i_c, 0, 0, 0 };
-            const s_stop = [_]c_int{ i_c + 1, sshape[1], sshape[2], sshape[3] };
-            const s_str = [_]c_int{ 1, 1, 1, 1 };
-            try mlx.check(mlx.mlx_slice(&ssm_slice, m.ssm_state, &s_start, 4, &s_stop, 4, &s_str, 4, self.s));
-            var ssm_own = mlx.mlx_array_new();
-            _ = mlx.mlx_array_set(&ssm_own, ssm_slice);
-            if (e.ssm_state.ctx != null) _ = mlx.mlx_array_free(e.ssm_state);
-            e.ssm_state = ssm_own;
-
+            try self.splitOptionalSsmArray(m.conv_state, &e.conv_state, i_c);
+            try self.splitOptionalSsmArray(m.ssm_state, &e.ssm_state, i_c);
             try self.splitOptionalSsmArray(m.aux_state, &e.aux_state, i_c);
             try self.splitOptionalSsmArray(m.qsa_pooled, &e.qsa_pooled, i_c);
             e.qsa_ratio = m.qsa_ratio;
             e.qsa_len = m.qsa_len;
 
-            e.initialized = true;
+            e.initialized = m.initialized;
         }
     }
 
@@ -10896,13 +10876,16 @@ pub const Transformer = struct {
             return;
         }
         const shape = mlx.getShape(merged);
-        if (shape.len != 3 or row < 0 or row >= shape[0]) return error.Qwen4BatchStateShapeMismatch;
+        if ((shape.len != 3 and shape.len != 4) or row < 0 or row >= shape[0]) return error.Qwen4BatchStateShapeMismatch;
         var view = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(view);
-        const start = [_]c_int{ row, 0, 0 };
-        const stop = [_]c_int{ row + 1, shape[1], shape[2] };
-        const strides = [_]c_int{ 1, 1, 1 };
-        try mlx.check(mlx.mlx_slice(&view, merged, &start, 3, &stop, 3, &strides, 3, self.s));
+        var start = [_]c_int{ 0, 0, 0, 0 };
+        var stop = [_]c_int{ 0, 0, 0, 0 };
+        const strides = [_]c_int{ 1, 1, 1, 1 };
+        start[0] = row;
+        stop[0] = row + 1;
+        for (1..shape.len) |d| stop[d] = shape[d];
+        try mlx.check(mlx.mlx_slice(&view, merged, &start, shape.len, &stop, shape.len, &strides, shape.len, self.s));
         var own = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_array_set(&own, view));
         if (dst.ctx != null) _ = mlx.mlx_array_free(dst.*);
@@ -37838,4 +37821,41 @@ test "qwen4 batched PLE history advances independently for short and wide lanes"
     try testing.expectEqualSlices(u32, &[_]u32{ 12, 31 }, a.ple_prev[0..2]);
     try testing.expectEqualSlices(u32, &[_]u32{ 42, 43 }, b.ple_prev[0..2]);
     try testing.expect(a.ple_prev_valid and b.ple_prev_valid);
+}
+
+test "qwen4 cold batch state preserves null arrays and rejects mixed presence" {
+    const s = mlx.gpuStream();
+    var lanes = [_][1]SSMCacheEntry{
+        .{.{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false }},
+        .{.{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false }},
+    };
+    defer for (&lanes) |*lane| {
+        _ = mlx.mlx_array_free(lane[0].conv_state);
+        _ = mlx.mlx_array_free(lane[0].ssm_state);
+        if (lane[0].aux_state.ctx != null) _ = mlx.mlx_array_free(lane[0].aux_state);
+    };
+    var tr: Transformer = undefined;
+    tr.allocator = testing.allocator;
+    tr.s = s;
+    var c0: ForwardCtx = undefined;
+    var c1: ForwardCtx = undefined;
+    c0.ssm_entries = lanes[0][0..];
+    c1.ssm_entries = lanes[1][0..];
+    const ctxs = [_]*ForwardCtx{ &c0, &c1 };
+
+    var merged = try tr.mergeSsmAcrossSlots(&ctxs, 0);
+    defer {
+        if (merged.conv_state.ctx != null) _ = mlx.mlx_array_free(merged.conv_state);
+        if (merged.ssm_state.ctx != null) _ = mlx.mlx_array_free(merged.ssm_state);
+        if (merged.aux_state.ctx != null) _ = mlx.mlx_array_free(merged.aux_state);
+        if (merged.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(merged.qsa_pooled);
+    }
+    try testing.expect(!merged.initialized);
+    try testing.expect(merged.conv_state.ctx == null and merged.ssm_state.ctx == null and merged.aux_state.ctx == null);
+    try tr.splitSsmToSlots(&merged, &ctxs, 0);
+    try testing.expect(!lanes[0][0].initialized and !lanes[1][0].initialized);
+
+    var prng = std.Random.DefaultPrng.init(0xC01D_B47C);
+    lanes[1][0].aux_state = try attn256RandBf16(prng.random(), &[_]c_int{ 1, 2, 3 }, s);
+    try testing.expectError(error.Qwen4BatchStatePresenceMismatch, tr.mergeSsmAcrossSlots(&ctxs, 0));
 }
